@@ -4,6 +4,7 @@ import NetworkExtension
 struct RootView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
     @State private var showPlaces = false
 
@@ -19,6 +20,15 @@ struct RootView: View {
             )
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
+        }
+        .onAppear {
+            session.resumeIfNeeded(pairing: pairing)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            session.handleScenePhase(phase, pairing: pairing)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { _ in
+            session.reconnectNow(pairing: pairing)
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()

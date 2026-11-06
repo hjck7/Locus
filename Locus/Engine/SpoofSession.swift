@@ -1,6 +1,7 @@
 import CoreLocation
 import Foundation
 import MapKit
+import SwiftUI
 import UIKit
 import UserNotifications
 
@@ -102,6 +103,8 @@ final class SpoofSession: ObservableObject {
     private var healthTimer: Timer?
     private var joystickTimer: Timer?
     private var routeTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var resendInFlight = false
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
     private var joystickVector: CGVector = .zero
     private let locationKeeper = BackgroundKeepAlive()
@@ -109,6 +112,7 @@ final class SpoofSession: ObservableObject {
     private let favoritesKey = "locus.favorites"
     private let recentsKey = "locus.recents"
     private let homeKey = "locus.home"
+    private let activeSimulationKey = "locus.activeSimulation"
     private let customSpeedEnabledKey = "locus.customSpeedEnabled"
     private let customSpeedKey = "locus.customSpeedKmh"
 
@@ -156,6 +160,8 @@ final class SpoofSession: ObservableObject {
     func stop(pairing: PairingStore) {
         routeTask?.cancel()
         routeTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         stopJoystick()
         stopResend()
         stopHealth()
@@ -168,6 +174,7 @@ final class SpoofSession: ObservableObject {
             pin = nil
             status = .idle
             lastError = nil
+            SavedPlace.save([], key: activeSimulationKey)
             endBackground()
             // Force a fresh fix so the map puck / locate button return to the
             // real GPS position (not the leftover pin or last spoofed fix).
@@ -178,6 +185,41 @@ final class SpoofSession: ObservableObject {
             status = .dropped(error.localizedDescription)
             postDropNotification(error.localizedDescription)
         }
+    }
+
+    /// Picks up a simulation that was running when the app was closed.
+    func resumeIfNeeded(pairing: PairingStore) {
+        guard simulated == nil, pairing.hasPairingFile,
+              let saved = SavedPlace.load(key: activeSimulationKey).first else { return }
+        simulated = saved.coordinate
+        pin = saved.coordinate
+        locationKeeper.useHighAccuracy(false)
+        locationKeeper.start()
+        startResend(pairing: pairing)
+        startHealth(pairing: pairing)
+        startReconnect(pairing: pairing)
+    }
+
+    func handleScenePhase(_ phase: ScenePhase, pairing: PairingStore) {
+        switch phase {
+        case .active:
+            startLocationUpdates()
+            reconnectNow(pairing: pairing)
+        case .background:
+            if !canRestore {
+                locationKeeper.stop()
+            }
+        default:
+            break
+        }
+    }
+
+    /// Retries at once, e.g. when the tunnel returns, instead of waiting out the backoff.
+    func reconnectNow(pairing: PairingStore) {
+        guard isSpoofing, !LocationEngine.isSessionActive else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        startReconnect(pairing: pairing)
     }
 
     func goHome(pairing: PairingStore) {
@@ -277,6 +319,9 @@ final class SpoofSession: ObservableObject {
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     // A cancelled sleep returns at once; applying here would re-enable
                     // the simulation right after a restore.
+                    while self.status == .reconnecting && !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
                     if Task.isCancelled { break }
                     await MainActor.run {
                         self.apply(coord, pairing: pairing, markRecent: false)
@@ -375,26 +420,84 @@ final class SpoofSession: ObservableObject {
             pin = coordinate
             status = .active
             lastError = nil
+            reconnectTask?.cancel()
+            reconnectTask = nil
             beginBackground()
+            locationKeeper.useHighAccuracy(false)
             locationKeeper.start()
             startResend(pairing: pairing)
             startHealth(pairing: pairing)
             if markRecent {
                 pushRecent(coordinate)
+                saveActiveSimulation(coordinate)
             }
         case .failure(let error):
-            lastError = error.localizedDescription
             if simulated != nil {
-                status = .dropped(error.localizedDescription)
-                postDropNotification(error.localizedDescription)
+                // Keep the target; only Stop ends a simulation.
+                simulated = coordinate
+                startReconnect(pairing: pairing)
             } else {
+                lastError = error.localizedDescription
                 status = .idle
             }
         }
     }
 
+    private func saveActiveSimulation(_ coordinate: CLLocationCoordinate2D) {
+        let place = SavedPlace(name: "", latitude: coordinate.latitude, longitude: coordinate.longitude)
+        SavedPlace.save([place], key: activeSimulationKey)
+    }
+
+    /// Off the main actor: reconnecting can take seconds and must not freeze the UI.
+    private func send(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore) async -> Bool {
+        let latitude = coordinate.latitude
+        let longitude = coordinate.longitude
+        let path = pairing.pairingPath
+        let ip = TunnelConfig.targetIP
+        let result = await Task.detached(priority: .userInitiated) {
+            LocationEngine.set(latitude: latitude, longitude: longitude, pairingPath: path, deviceIP: ip)
+        }.value
+        // Stop may have run while this was in flight; don't leave it re-enabled.
+        guard simulated != nil else {
+            _ = await Task.detached(priority: .userInitiated) {
+                LocationEngine.clear(pairingPath: path, deviceIP: ip)
+            }.value
+            return false
+        }
+        if case .success = result { return true }
+        return false
+    }
+
+    /// Retries until it works or Stop is pressed; a lost tunnel never ends the simulation.
+    private func startReconnect(pairing: PairingStore) {
+        guard reconnectTask == nil, simulated != nil else { return }
+        status = .reconnecting
+        beginBackground()
+        reconnectTask = Task { [weak self] in
+            var attempts = 0
+            var delaySeconds: UInt64 = 1
+            while !Task.isCancelled {
+                guard let self, let target = self.simulated else { return }
+                let delivered = await self.send(target, pairing: pairing)
+                if Task.isCancelled { return }
+                if delivered {
+                    self.reconnectTask = nil
+                    self.status = .active
+                    self.lastError = nil
+                    return
+                }
+                attempts += 1
+                if attempts == 5 {
+                    self.postDropNotification("Still reconnecting. Keep LocalDevVPN connected.")
+                }
+                try? await Task.sleep(nanoseconds: delaySeconds * 1_000_000_000)
+                delaySeconds = min(delaySeconds * 2, 8)
+            }
+        }
+    }
+
     private func tickJoystick(pairing: PairingStore) {
-        guard joystickActive, let current = simulated else { return }
+        guard joystickActive, status == .active, let current = simulated else { return }
         let magnitude = hypot(joystickVector.dx, joystickVector.dy)
         guard magnitude > 0.08 else { return }
         let nx = joystickVector.dx / magnitude
@@ -409,15 +512,17 @@ final class SpoofSession: ObservableObject {
 
     private func startResend(pairing: PairingStore) {
         resendTimer?.invalidate()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
+        resendTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                _ = LocationEngine.set(
-                    latitude: sim.latitude,
-                    longitude: sim.longitude,
-                    pairingPath: pairing.pairingPath,
-                    deviceIP: TunnelConfig.targetIP
-                )
+                guard let self, !self.resendInFlight, self.reconnectTask == nil,
+                      let sim = self.simulated else { return }
+                self.saveActiveSimulation(sim)
+                self.resendInFlight = true
+                let delivered = await self.send(sim, pairing: pairing)
+                self.resendInFlight = false
+                if !delivered {
+                    self.startReconnect(pairing: pairing)
+                }
             }
         }
     }
@@ -429,16 +534,10 @@ final class SpoofSession: ObservableObject {
 
     private func startHealth(pairing: PairingStore) {
         healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                if case .dropped = self.status {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                } else if !LocationEngine.isSessionActive, self.isSpoofing {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                }
+                guard let self, self.isSpoofing, !LocationEngine.isSessionActive else { return }
+                self.startReconnect(pairing: pairing)
             }
         }
     }
