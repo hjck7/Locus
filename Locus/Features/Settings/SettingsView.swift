@@ -180,6 +180,12 @@ struct SettingsView: View {
                     DrivingBehaviorFields()
                 }
 
+                Section {
+                    Toggle("Ankunft in der Dynamic Island", isOn: $session.liveActivityEnabled)
+                } footer: {
+                    Text("Zeigt während einer Fahrt Arriving in … at … an.")
+                }
+
                 Section("Datenschutz") {
                     Text("Orte bleiben auf dem iPhone. Keine Analyse, kein Konto. Nur beim Planen wird der Routenverlauf an OpenStreetMap geschickt, um Ampeln zu finden.")
                         .font(.footnote)

@@ -52,6 +52,14 @@ enum StopDuration: Int, CaseIterable, Identifiable {
     }
 }
 
+/// A point of a Rundfahrt with its stay.
+struct CruiseStop: Identifiable {
+    let id = UUID()
+    var name: String
+    var coordinate: CLLocationCoordinate2D
+    var stayMinutes: Double
+}
+
 /// A planned stop shown on the map during a trip.
 struct RouteStopMarker: Identifiable {
     let id: Int
@@ -66,9 +74,11 @@ struct RouteProgress: Equatable {
     var total: CLLocationDistance
     var speedKmh: Double
     var cruiseSpeed: CLLocationSpeed
+    /// Set while staying somewhere instead of driving.
+    var secondsLeft: TimeInterval?
 
     var remaining: CLLocationDistance { max(total - travelled, 0) }
-    var remainingTime: TimeInterval { remaining / max(cruiseSpeed, 0.1) }
+    var remainingTime: TimeInterval { secondsLeft ?? remaining / max(cruiseSpeed, 0.1) }
     var fraction: Double { total > 0 ? min(travelled / total, 1) : 0 }
 }
 
@@ -152,6 +162,13 @@ final class SpoofSession: ObservableObject {
     @Published private(set) var routeProgress: RouteProgress?
     @Published private(set) var activeRoute: [CLLocationCoordinate2D] = []
     @Published private(set) var stopMarkers: [RouteStopMarker] = []
+    @Published private(set) var routeSignals: [CLLocationCoordinate2D] = []
+    @Published var liveActivityEnabled = true {
+        didSet {
+            UserDefaults.standard.set(liveActivityEnabled, forKey: liveActivityKey)
+            if !liveActivityEnabled { liveActivity.end() }
+        }
+    }
     @Published private(set) var isPlanningRoute = false
     @Published var routePaused = false
     @Published private(set) var shortcuts: [SavedPlace] = []
@@ -201,6 +218,9 @@ final class SpoofSession: ObservableObject {
     private let customSpeedEnabledKey = "locus.customSpeedEnabled"
     private let customSpeedKey = "locus.customSpeedKmh"
     private let shortcutsKey = "locus.shortcuts"
+    private let liveActivityKey = "locus.liveActivity"
+    private let liveActivity = RouteLiveActivity()
+    private var routePhase = ""
     private let stopFrequencyKey = "locus.stopFrequency"
     private let stopDurationKey = "locus.stopDuration"
     private let updateIntervalKey = "locus.updateInterval"
@@ -217,6 +237,9 @@ final class SpoofSession: ObservableObject {
         home = SavedPlace.load(key: homeKey).first
         shortcuts = Array(SavedPlace.load(key: shortcutsKey).prefix(Self.maxShortcuts))
         let defaults = UserDefaults.standard
+        if defaults.object(forKey: liveActivityKey) != nil {
+            liveActivityEnabled = defaults.bool(forKey: liveActivityKey)
+        }
         if defaults.object(forKey: stopFrequencyKey) != nil {
             stopFrequency = StopFrequency(rawValue: defaults.integer(forKey: stopFrequencyKey)) ?? .normal
         }
@@ -423,27 +446,118 @@ final class SpoofSession: ObservableObject {
     }
 
     func followRoute(_ plan: RoutePlan, pairing: PairingStore) {
+        guard beginTrip(pairing: pairing), plan.path.coordinates.count >= 2 else { return }
+        routeTask = Task { [weak self] in
+            guard let self else { return }
+            await self.driveLeg(plan, pairing: pairing)
+            if !Task.isCancelled {
+                self.finishTrip()
+            }
+        }
+    }
+
+    /// Drives between the stops until cancelled, reusing each leg's route so the
+    /// same roads come up again.
+    func startCruise(_ stops: [CruiseStop], pairing: PairingStore) {
+        guard stops.count >= 2, beginTrip(pairing: pairing) else { return }
+        let mode = travelMode
+        routeTask = Task { [weak self] in
+            guard let self else { return }
+            var plans: [String: RoutePlan] = [:]
+            var current = 0
+            var previous = 0
+            self.apply(stops[0].coordinate, pairing: pairing, markRecent: false)
+            self.pin = nil
+            while !Task.isCancelled {
+                await self.stay(at: stops[current])
+                if Task.isCancelled { return }
+                let next = Self.nextCruiseStop(current: current, previous: previous, count: stops.count)
+                let key = "\(current)-\(next)"
+                if plans[key] == nil {
+                    plans[key] = await Self.cruisePlan(from: stops[current], to: stops[next], mode: mode)
+                }
+                guard let plan = plans[key] else {
+                    self.lastError = "Keine Route zwischen \(stops[current].name) und \(stops[next].name) gefunden."
+                    self.finishTrip()
+                    return
+                }
+                await self.driveLeg(plan, pairing: pairing)
+                previous = current
+                current = next
+            }
+        }
+    }
+
+    private static func nextCruiseStop(current: Int, previous: Int, count: Int) -> Int {
+        let roll = Double.random(in: 0..<1)
+        if roll < 0.6 { return (current + 1) % count }
+        if roll < 0.8, previous != current { return previous }
+        let others = (0..<count).filter { $0 != current }
+        return others.randomElement() ?? (current + 1) % count
+    }
+
+    private static func cruisePlan(from: CruiseStop, to: CruiseStop, mode: TravelMode) async -> RoutePlan? {
+        guard let candidate = try? await RouteBuilder.routes(through: [from.coordinate, to.coordinate], mode: mode).first else {
+            return nil
+        }
+        let lights = await RouteBuilder.signals(along: candidate.coordinates, mode: mode) ?? []
+        let name = to.name
+        return await Task.detached(priority: .userInitiated) {
+            RouteBuilder.plan(candidate, signals: lights, destinationName: name)
+        }.value
+    }
+
+    private func stay(at stop: CruiseStop) async {
+        var seconds = Int(stop.stayMinutes * 60 * Double.random(in: 0.8...1.2))
+        routePhase = "Bleibt bei \(stop.name)"
+        while seconds > 0, !Task.isCancelled {
+            if !routePaused {
+                let label = String(format: "%d:%02d", seconds / 60, seconds % 60)
+                routeProgress = RouteProgress(
+                    title: "Bleibt bei \(stop.name) (\(label))",
+                    travelled: 0,
+                    total: 0,
+                    speedKmh: 0,
+                    cruiseSpeed: activeSpeed,
+                    secondsLeft: TimeInterval(seconds)
+                )
+                updateLiveActivity(destination: stop.name, seconds: TimeInterval(seconds))
+                seconds -= 1
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    private func beginTrip(pairing: PairingStore) -> Bool {
         guard pairing.hasPairingFile else {
             lastError = "Richte zuerst die Kopplung in den Optionen ein."
-            return
+            return false
         }
-        guard plan.path.coordinates.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
         routePaused = false
-        routeTask = Task { [weak self] in
-            await self?.runRoute(plan, pairing: pairing)
-        }
+        return true
+    }
+
+    private func finishTrip() {
+        routeProgress = nil
+        activeRoute = []
+        routeSignals = []
+        stopMarkers = []
+        liveActivity.end()
     }
 
     /// Leaves the simulation where the route currently is.
     func cancelRoute() {
         routeTask?.cancel()
         routeTask = nil
-        routeProgress = nil
         routePaused = false
-        activeRoute = []
-        stopMarkers = []
+        finishTrip()
+    }
+
+    private func updateLiveActivity(destination: String, seconds: TimeInterval) {
+        guard liveActivityEnabled else { return }
+        liveActivity.update(destination: destination, remaining: seconds)
     }
 
     /// Plans a car route to a shortcut, drives it at a fixed speed and stays there.
@@ -460,13 +574,15 @@ final class SpoofSession: ObservableObject {
                     self?.lastError = "Keine Route gefunden."
                     return
                 }
-                let signals = await RouteBuilder.signals(along: candidate.coordinates, mode: .drive)
+                let lights = await RouteBuilder.signals(along: candidate.coordinates, mode: .drive) ?? []
+                let speed = Self.shortcutSpeedKmh / 3.6
+                let name = place.name
+                let plan = await Task.detached(priority: .userInitiated) {
+                    RouteBuilder.plan(candidate, signals: lights, speedOverride: speed, destinationName: name)
+                }.value
                 guard let self else { return }
                 self.isPlanningRoute = false
-                self.followRoute(
-                    RouteBuilder.plan(candidate, signals: signals, speedOverride: Self.shortcutSpeedKmh / 3.6),
-                    pairing: pairing
-                )
+                self.followRoute(plan, pairing: pairing)
             } catch {
                 self?.isPlanningRoute = false
                 self?.lastError = error.localizedDescription
@@ -512,10 +628,26 @@ final class SpoofSession: ObservableObject {
         }
     }
 
-    private func runRoute(_ plan: RoutePlan, pairing: PairingStore) async {
+    /// Off the main actor so a slow tunnel can't stall the map while moving.
+    private func moveSimulation(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) async {
+        simulated = coordinate
+        if !(await send(coordinate, pairing: pairing)), simulated != nil {
+            startReconnect(pairing: pairing)
+        }
+    }
+
+    private func driveLeg(_ plan: RoutePlan, pairing: PairingStore) async {
         let path = plan.path
         let stops = rollStops(for: plan)
-        activeRoute = path.coordinates
+        let destinationName: String
+        if let name = plan.destinationName, !PlaceNamer.isCoordinateLabel(name) {
+            destinationName = name
+        } else {
+            destinationName = await PlaceNamer.name(for: path.coordinate(at: path.length))
+        }
+        if Task.isCancelled { return }
+        activeRoute = plan.displayCoordinates
+        routeSignals = plan.signals
         stopMarkers = stops.enumerated().compactMap { index, stop in
             guard stop.waitSeconds > 0 else { return nil }
             return RouteStopMarker(
@@ -532,12 +664,16 @@ final class SpoofSession: ObservableObject {
         var speed: CLLocationSpeed = 0
         var pace = 1.0
 
-        pin = path.coordinate(at: 0)
-        apply(path.coordinate(at: 0), pairing: pairing, markRecent: true)
+        if isSpoofing {
+            await moveSimulation(to: path.coordinate(at: 0), pairing: pairing)
+        } else {
+            apply(path.coordinate(at: 0), pairing: pairing, markRecent: true)
+            pin = nil
+        }
 
         while travelled < path.length, !Task.isCancelled {
             while (routePaused || status == .reconnecting), !Task.isCancelled {
-                publishRoute(plan, travelled: travelled, speed: 0, title: routePaused ? "Pausiert" : "Verbindung wird wiederhergestellt…")
+                publishRoute(plan, travelled: travelled, speed: 0, title: routePaused ? "Pausiert" : "Verbindung wird wiederhergestellt…", destination: destinationName)
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
             let interval = updateInterval
@@ -563,13 +699,14 @@ final class SpoofSession: ObservableObject {
             }
 
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            // A cancelled sleep returns at once; applying here would re-enable
+            // A cancelled sleep returns at once; moving here would re-enable
             // the simulation right after a restore.
             if Task.isCancelled { return }
 
             travelled = min(travelled + step, path.length)
-            apply(path.coordinate(at: travelled), pairing: pairing, markRecent: false)
-            publishRoute(plan, travelled: travelled, speed: speed, title: "Unterwegs")
+            await moveSimulation(to: path.coordinate(at: travelled), pairing: pairing)
+            if Task.isCancelled { return }
+            publishRoute(plan, travelled: travelled, speed: speed, title: "Unterwegs nach \(destinationName)", destination: destinationName)
 
             guard reachedStop else { continue }
             let stop = stops[nextStop]
@@ -579,7 +716,7 @@ final class SpoofSession: ObservableObject {
                 speed = 0
                 for remaining in stride(from: stop.waitSeconds, to: 0, by: -1) {
                     if Task.isCancelled { return }
-                    publishRoute(plan, travelled: travelled, speed: 0, title: "\(stop.reason) (\(remaining) s)")
+                    publishRoute(plan, travelled: travelled, speed: 0, title: "\(stop.reason) (\(remaining) s)", destination: destinationName)
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
                 stopMarkers.removeAll { $0.id == stopIndex }
@@ -587,23 +724,20 @@ final class SpoofSession: ObservableObject {
                 speed = min(speed, stop.exitSpeed)
             }
         }
-
-        if !Task.isCancelled {
-            routeProgress = nil
-            activeRoute = []
-            stopMarkers = []
-        }
     }
 
-    private func publishRoute(_ plan: RoutePlan, travelled: CLLocationDistance, speed: CLLocationSpeed, title: String) {
+    private func publishRoute(_ plan: RoutePlan, travelled: CLLocationDistance, speed: CLLocationSpeed, title: String, destination: String) {
         let cruise = plan.speedOverride ?? activeSpeed
-        routeProgress = RouteProgress(
+        let progress = RouteProgress(
             title: title,
             travelled: travelled,
             total: plan.path.length,
             speedKmh: speed * 3.6,
-            cruiseSpeed: cruise
+            cruiseSpeed: cruise,
+            secondsLeft: nil
         )
+        routeProgress = progress
+        updateLiveActivity(destination: destination, seconds: progress.remainingTime)
     }
 
     func addFavorite(name: String, coordinate: CLLocationCoordinate2D) {

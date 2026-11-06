@@ -9,6 +9,34 @@ struct RouteCandidate: Identifiable {
     var coordinates: [CLLocationCoordinate2D]
     /// Starts of Apple Maps maneuvers, i.e. real turns and junctions.
     var turns: [CLLocationCoordinate2D]
+    let length: CLLocationDistance
+    /// Thinned out for drawing; long routes would otherwise slow the map down.
+    let displayCoordinates: [CLLocationCoordinate2D]
+
+    init(title: String, coordinates: [CLLocationCoordinate2D], turns: [CLLocationCoordinate2D]) {
+        self.title = title
+        self.coordinates = coordinates
+        self.turns = turns
+        length = RoutePath(coordinates).length
+        let stride = max(1, coordinates.count / 400)
+        var thinned = coordinates.enumerated().filter { $0.offset % stride == 0 }.map(\.element)
+        if let last = coordinates.last { thinned.append(last) }
+        displayCoordinates = thinned
+    }
+}
+
+/// Turns coordinates into names people recognise.
+enum PlaceNamer {
+    static func isCoordinateLabel(_ name: String) -> Bool {
+        let parts = name.split(separator: ",")
+        return parts.count == 2 && parts.allSatisfy { Double($0.trimmingCharacters(in: .whitespaces)) != nil }
+    }
+
+    static func name(for coordinate: CLLocationCoordinate2D) async -> String {
+        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        let placemark = try? await CLGeocoder().reverseGeocodeLocation(location).first
+        return placemark?.name ?? placemark?.thoroughfare ?? placemark?.locality ?? "Ziel"
+    }
 }
 
 /// A polyline addressed by the distance travelled along it.
@@ -97,12 +125,18 @@ struct RoutePlan {
     var waypoints: [RouteWaypoint]
     /// Fixed speed for this trip, overriding the travel mode and custom speed.
     var speedOverride: CLLocationSpeed?
+    var destinationName: String?
+    var signals: [CLLocationCoordinate2D]
+    var displayCoordinates: [CLLocationCoordinate2D]
 }
 
 enum RouteBuilder {
+    // Public servers are often overloaded, so all are asked and the first answer wins.
     private static let signalEndpoints = [
+        "https://overpass.openstreetmap.fr/api/interpreter",
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
     ]
 
     static func routes(
@@ -110,20 +144,25 @@ enum RouteBuilder {
         mode: TravelMode
     ) async throws -> [RouteCandidate] {
         guard stops.count >= 2 else { return [] }
-        if stops.count == 2 {
-            let routes = try await calculate(from: stops[0], to: stops[1], mode: mode, alternates: true)
-            return routes.prefix(3).map(candidate(from:))
-        }
-        var joined = RouteCandidate(title: "Route mit Zwischenstopps", coordinates: [], turns: [])
+        var legs: [[RouteCandidate]] = []
         for (from, to) in zip(stops, stops.dropFirst()) {
-            guard let route = try await calculate(from: from, to: to, mode: mode, alternates: false).first else {
-                throw noRouteError
-            }
-            let leg = candidate(from: route)
-            joined.coordinates += leg.coordinates
-            joined.turns += leg.turns
+            let routes = try await calculate(from: from, to: to, mode: mode, alternates: true)
+            legs.append(routes.prefix(3).map(candidate(from:)))
         }
-        return [joined]
+        if legs.count == 1 { return legs[0] }
+
+        // Multi-stop trips vary the leg with the most choices.
+        let variable = legs.indices.max { legs[$0].count < legs[$1].count } ?? 0
+        return legs[variable].indices.map { option in
+            var coordinates: [CLLocationCoordinate2D] = []
+            var turns: [CLLocationCoordinate2D] = []
+            for index in legs.indices {
+                let leg = legs[index][index == variable ? option : 0]
+                coordinates += leg.coordinates
+                turns += leg.turns
+            }
+            return RouteCandidate(title: option == 0 ? "Beste Route" : "Alternative \(option)", coordinates: coordinates, turns: turns)
+        }
     }
 
     private static var noRouteError: NSError {
@@ -168,12 +207,12 @@ enum RouteBuilder {
         return coords
     }
 
-    /// Traffic lights and stop signs near the route from OpenStreetMap. Best effort:
-    /// the public servers are often busy, and plans then fall back to the route's turns.
+    /// Traffic lights and stop signs near the route from OpenStreetMap, or nil when
+    /// no server answered, in which case plans fall back to the route's turns.
     static func signals(
         along coordinates: [CLLocationCoordinate2D],
         mode: TravelMode
-    ) async -> [CLLocationCoordinate2D] {
+    ) async -> [CLLocationCoordinate2D]? {
         guard coordinates.count > 1 else { return [] }
         let path = RoutePath(coordinates)
         let spacing = max(80, path.length / 150)
@@ -182,32 +221,44 @@ enum RouteBuilder {
             .map { String(format: "%.5f,%.5f", $0.latitude, $0.longitude) }
             .joined(separator: ",")
         let types = mode == .walk || mode == .run ? "traffic_signals|crossing" : "traffic_signals|stop"
-        let query = "[out:json][timeout:6];node[\"highway\"~\"^(\(types))$\"](around:18,\(line));out skel;"
+        let query = "[out:json][timeout:15];node[\"highway\"~\"^(\(types))$\"](around:18,\(line));out skel;"
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
-        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) else { return [] }
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
 
-        for endpoint in signalEndpoints {
-            guard let url = URL(string: endpoint) else { continue }
-            var request = URLRequest(url: url, timeoutInterval: 8)
-            request.httpMethod = "POST"
-            request.setValue("LocationLarper/1.2 (iOS)", forHTTPHeaderField: "User-Agent")
-            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            request.httpBody = Data("data=\(encoded)".utf8)
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
-                  (response as? HTTPURLResponse)?.statusCode == 200,
-                  let decoded = try? JSONDecoder().decode(OverpassResponse.self, from: data) else { continue }
-            return decoded.elements
-                .map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-                .filter { path.nearest(to: $0).offset <= 25 }
+        let found = await withTaskGroup(of: [CLLocationCoordinate2D]?.self) { group -> [CLLocationCoordinate2D]? in
+            for endpoint in signalEndpoints {
+                group.addTask { await fetchSignals(from: endpoint, body: "data=\(encoded)") }
+            }
+            for await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            return nil
         }
-        return []
+        return found?.filter { path.nearest(to: $0).offset <= 25 }
+    }
+
+    private static func fetchSignals(from endpoint: String, body: String) async -> [CLLocationCoordinate2D]? {
+        guard let url = URL(string: endpoint) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.setValue("LocationLarper/1.4 (iOS)", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let decoded = try? JSONDecoder().decode(OverpassResponse.self, from: data) else { return nil }
+        return decoded.elements.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
     }
 
     static func plan(
         _ candidate: RouteCandidate,
         signals: [CLLocationCoordinate2D],
-        speedOverride: CLLocationSpeed? = nil
+        speedOverride: CLLocationSpeed? = nil,
+        destinationName: String? = nil
     ) -> RoutePlan {
         let path = RoutePath(candidate.coordinates)
         let lights = signals.map { RouteWaypoint(distance: path.nearest(to: $0).along, kind: .trafficLight) }
@@ -224,7 +275,14 @@ enum RouteBuilder {
             }
             waypoints.append(waypoint)
         }
-        return RoutePlan(path: path, waypoints: waypoints, speedOverride: speedOverride)
+        return RoutePlan(
+            path: path,
+            waypoints: waypoints,
+            speedOverride: speedOverride,
+            destinationName: destinationName,
+            signals: signals,
+            displayCoordinates: candidate.displayCoordinates
+        )
     }
 
     static func sample(coordinates: [CLLocationCoordinate2D], every meters: CLLocationDistance) -> [CLLocationCoordinate2D] {

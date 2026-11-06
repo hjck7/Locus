@@ -85,22 +85,34 @@ struct MapHomeView: View {
                         }
                     }
                     ForEach(planner.candidates.filter { $0.id != planner.selected?.id }) { candidate in
-                        MapPolyline(coordinates: candidate.coordinates)
+                        MapPolyline(coordinates: candidate.displayCoordinates)
                             .stroke(.gray.opacity(0.6), lineWidth: 4)
                     }
                     if let route = planner.selected {
-                        MapPolyline(coordinates: route.coordinates)
+                        MapPolyline(coordinates: route.displayCoordinates)
                             .stroke(LocusTheme.accent, lineWidth: 6)
                     }
                     if !session.activeRoute.isEmpty {
                         MapPolyline(coordinates: session.activeRoute)
                             .stroke(LocusTheme.accentSecondary, lineWidth: 6)
                     }
-                    if session.routeProgress == nil {
-                        ForEach(Array(planner.signals.enumerated()), id: \.offset) { _, signal in
-                            Annotation("", coordinate: signal) {
-                                Text("🚦").font(.caption2)
+                    if planner.mode == .cruise, planner.cruiseStops.count > 1, session.routeProgress == nil {
+                        MapPolyline(coordinates: planner.cruiseStops.map(\.coordinate))
+                            .stroke(LocusTheme.accentSecondary, style: StrokeStyle(lineWidth: 3, dash: [6, 6]))
+                    }
+                    if planner.mode == .cruise {
+                        ForEach(Array(planner.cruiseStops.enumerated()), id: \.element.id) { index, stop in
+                            Annotation(stop.name, coordinate: stop.coordinate) {
+                                routeBadge(index == 0 ? "S" : "\(index)", color: LocusTheme.accentSecondary)
                             }
+                        }
+                    }
+                    ForEach(Array((session.routeProgress == nil ? planner.signals : session.routeSignals).enumerated()), id: \.offset) { _, signal in
+                        Annotation("", coordinate: signal) {
+                            Text("🚦")
+                                .font(.footnote)
+                                .padding(3)
+                                .background(Circle().fill(.black.opacity(0.65)))
                         }
                     }
                     ForEach(session.stopMarkers) { marker in
@@ -171,6 +183,10 @@ struct MapHomeView: View {
                     planner.pickingSlot = slot
                     session.showRoutePlanner = false
                 },
+                onTapMode: {
+                    planner.tapMode = true
+                    session.showRoutePlanner = false
+                },
                 onDraw: {
                     drawMode = true
                     session.showRoutePlanner = false
@@ -219,7 +235,9 @@ struct MapHomeView: View {
 
     private func placePin(at point: CGPoint, proxy: MapProxy) {
         guard let coord = proxy.convert(point, from: .local) else { return }
-        if let slot = planner.pickingSlot {
+        if planner.tapMode {
+            planner.addTap(coord, session: session)
+        } else if let slot = planner.pickingSlot {
             planner.pickingSlot = nil
             planner.assign(slot, name: coordinateLabel(coord), coordinate: coord, session: session)
             session.showRoutePlanner = true
@@ -259,17 +277,27 @@ struct MapHomeView: View {
                     Text(banner)
                         .font(.footnote.weight(.semibold))
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    if drawMode {
-                        Button("Fertig") { finishDrawing() }
-                            .font(.footnote.weight(.bold))
+                    if planner.tapMode {
+                        Button("Zurück") { planner.undoTap(session: session) }
+                            .font(.footnote.weight(.semibold))
+                        Button("Fertig") {
+                            planner.tapMode = false
+                            session.showRoutePlanner = true
+                        }
+                        .font(.footnote.weight(.bold))
+                    } else {
+                        if drawMode {
+                            Button("Fertig") { finishDrawing() }
+                                .font(.footnote.weight(.bold))
+                        }
+                        Button("Abbrechen") {
+                            planner.pickingSlot = nil
+                            drawMode = false
+                            drawnPath.removeAll()
+                            session.showRoutePlanner = true
+                        }
+                        .font(.footnote.weight(.semibold))
                     }
-                    Button("Abbrechen") {
-                        planner.pickingSlot = nil
-                        drawMode = false
-                        drawnPath.removeAll()
-                        session.showRoutePlanner = true
-                    }
-                    .font(.footnote.weight(.semibold))
                 }
                 .padding(12)
                 .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -281,6 +309,7 @@ struct MapHomeView: View {
     }
 
     private var mapBanner: String? {
+        if planner.tapMode { return planner.tapHint }
         if let slot = planner.pickingSlot {
             return "Tippe auf die Karte: \(slot.title) setzen"
         }

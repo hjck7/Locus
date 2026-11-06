@@ -22,6 +22,26 @@ enum RouteSlot: String, CaseIterable, Identifiable {
     }
 }
 
+enum PlannerMode: String, CaseIterable, Identifiable {
+    case route, cruise
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .route: return "Route"
+        case .cruise: return "Rundfahrt"
+        }
+    }
+}
+
+enum SignalState: Equatable {
+    case idle
+    case loading
+    case found(Int)
+    case unavailable
+}
+
 enum RouteFormat {
     static func distance(_ meters: CLLocationDistance) -> String {
         meters < 1000 ? "\(Int(meters)) m" : String(format: "%.1f km", meters / 1000)
@@ -36,19 +56,37 @@ enum RouteFormat {
 
 @MainActor
 final class RoutePlannerModel: ObservableObject {
+    static let maxCruiseStops = 6
+
+    @Published var mode = PlannerMode.route
     @Published var start: RouteStopDraft?
     @Published var vias: [RouteStopDraft] = []
     @Published var destination: RouteStopDraft?
+    @Published var cruiseStops: [CruiseStop] = []
     @Published private(set) var candidates: [RouteCandidate] = []
     @Published private(set) var selectedID: UUID?
     @Published private(set) var signals: [CLLocationCoordinate2D] = []
+    @Published private(set) var signalState = SignalState.idle
     @Published private(set) var isRouting = false
     @Published var pickingSlot: RouteSlot?
+    /// While on, every map tap adds the next point.
+    @Published var tapMode = false
 
     private var buildTask: Task<Void, Never>?
+    private var signalTask: Task<Void, Never>?
 
     var selected: RouteCandidate? {
         candidates.first { $0.id == selectedID } ?? candidates.first
+    }
+
+    var tapHint: String {
+        if mode == .cruise {
+            if cruiseStops.isEmpty { return "Tippe auf die Karte: Startpunkt setzen" }
+            return "Tippe den nächsten Punkt (\(cruiseStops.count)/\(Self.maxCruiseStops))"
+        }
+        if start == nil { return "Tippe auf die Karte: Start setzen" }
+        if destination == nil { return "Tippe auf die Karte: Ziel setzen" }
+        return "Tippe weiter, um die Route zu verlängern"
     }
 
     func assign(_ slot: RouteSlot, name: String, coordinate: CLLocationCoordinate2D, session: SpoofSession) {
@@ -58,7 +96,62 @@ final class RoutePlannerModel: ObservableObject {
         case .via: vias.append(draft)
         case .destination: destination = draft
         }
+        resolveName(of: draft)
         rebuild(session: session)
+    }
+
+    /// Adds a tapped point: Start, then Ziel; later taps turn the old Ziel into a stop.
+    func addTap(_ coordinate: CLLocationCoordinate2D, session: SpoofSession) {
+        let label = String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
+        if mode == .cruise {
+            guard cruiseStops.count < Self.maxCruiseStops else { return }
+            addCruiseStop(name: label, coordinate: coordinate)
+            return
+        }
+        if start == nil {
+            assign(.start, name: label, coordinate: coordinate, session: session)
+        } else if let previous = destination {
+            vias.append(previous)
+            assign(.destination, name: label, coordinate: coordinate, session: session)
+        } else {
+            assign(.destination, name: label, coordinate: coordinate, session: session)
+        }
+    }
+
+    func undoTap(session: SpoofSession) {
+        if mode == .cruise {
+            _ = cruiseStops.popLast()
+        } else if destination != nil {
+            destination = vias.popLast()
+            rebuild(session: session)
+        } else {
+            start = nil
+        }
+    }
+
+    func addCruiseStop(name: String, coordinate: CLLocationCoordinate2D) {
+        guard cruiseStops.count < Self.maxCruiseStops else { return }
+        let stop = CruiseStop(name: name, coordinate: coordinate, stayMinutes: 5)
+        cruiseStops.append(stop)
+        guard PlaceNamer.isCoordinateLabel(name) else { return }
+        Task { [weak self] in
+            let resolved = await PlaceNamer.name(for: coordinate)
+            guard let self, let index = self.cruiseStops.firstIndex(where: { $0.id == stop.id }) else { return }
+            self.cruiseStops[index].name = resolved
+        }
+    }
+
+    private func resolveName(of draft: RouteStopDraft) {
+        guard PlaceNamer.isCoordinateLabel(draft.name) else { return }
+        Task { [weak self] in
+            let resolved = await PlaceNamer.name(for: draft.coordinate)
+            guard let self else { return }
+            if self.start?.id == draft.id { self.start?.name = resolved }
+            if self.destination?.id == draft.id { self.destination?.name = resolved }
+            if let index = self.vias.firstIndex(where: { $0.id == draft.id }) {
+                self.vias[index].name = resolved
+            }
+        }
     }
 
     func remove(_ slot: RouteSlot, viaIndex: Int? = nil, session: SpoofSession) {
@@ -73,12 +166,14 @@ final class RoutePlannerModel: ObservableObject {
 
     func clear() {
         buildTask?.cancel()
+        signalTask?.cancel()
         start = nil
         vias = []
         destination = nil
         candidates = []
         selectedID = nil
         signals = []
+        signalState = .idle
         isRouting = false
     }
 
@@ -99,7 +194,9 @@ final class RoutePlannerModel: ObservableObject {
 
     func rebuild(session: SpoofSession) {
         buildTask?.cancel()
+        signalTask?.cancel()
         signals = []
+        signalState = .idle
         guard let destination else {
             candidates = []
             selectedID = nil
@@ -115,6 +212,9 @@ final class RoutePlannerModel: ObservableObject {
         let mode = session.travelMode
         isRouting = true
         buildTask = Task { [weak self] in
+            // Quick taps must not hit the Apple Maps rate limit.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if Task.isCancelled { return }
             do {
                 let found = try await RouteBuilder.routes(through: stops, mode: mode)
                 guard let self, !Task.isCancelled else { return }
@@ -135,17 +235,27 @@ final class RoutePlannerModel: ObservableObject {
     private func loadSignals(session: SpoofSession) {
         guard let candidate = selected else { return }
         let mode = session.travelMode
-        let id = candidate.id
-        Task { [weak self] in
+        signalTask?.cancel()
+        signals = []
+        signalState = .loading
+        signalTask = Task { [weak self] in
             let found = await RouteBuilder.signals(along: candidate.coordinates, mode: mode)
-            guard let self, self.selected?.id == id else { return }
-            self.signals = found
+            guard let self, !Task.isCancelled else { return }
+            self.signals = found ?? []
+            self.signalState = found.map { .found($0.count) } ?? .unavailable
         }
     }
 
     func startDriving(session: SpoofSession, pairing: PairingStore) {
         guard let candidate = selected else { return }
-        session.followRoute(RouteBuilder.plan(candidate, signals: signals), pairing: pairing)
+        let lights = signals
+        let name = destination?.name
+        Task {
+            let plan = await Task.detached(priority: .userInitiated) {
+                RouteBuilder.plan(candidate, signals: lights, destinationName: name)
+            }.value
+            session.followRoute(plan, pairing: pairing)
+        }
     }
 }
 
@@ -199,7 +309,7 @@ struct DrivingBehaviorFields: View {
     @EnvironmentObject private var session: SpoofSession
 
     var body: some View {
-        Picker("An Ampeln & Kreuzungen halten", selection: $session.stopFrequency) {
+        Picker("An Ampeln halten", selection: $session.stopFrequency) {
             ForEach(StopFrequency.allCases) { Text($0.title).tag($0) }
         }
         if session.stopFrequency != .off {
@@ -220,6 +330,7 @@ struct DrivingBehaviorFields: View {
 struct RoutePlannerSheet: View {
     @ObservedObject var planner: RoutePlannerModel
     var onPickOnMap: (RouteSlot) -> Void
+    var onTapMode: () -> Void
     var onDraw: () -> Void
     var onImportGPX: () -> Void
     var onExportGPX: () -> Void
@@ -232,38 +343,36 @@ struct RoutePlannerSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                stopsSection
+                Section {
+                    Picker("Modus", selection: $planner.mode) {
+                        ForEach(PlannerMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Button {
+                        onTapMode()
+                    } label: {
+                        Label("Punkte auf der Karte antippen", systemImage: "hand.tap.fill")
+                            .font(.headline)
+                    }
+                }
+
+                if planner.mode == .route {
+                    stopsSection
+                } else {
+                    cruiseSection
+                }
                 modeSection
-                if planner.isRouting || !planner.candidates.isEmpty {
+                if planner.mode == .route, planner.isRouting || !planner.candidates.isEmpty {
                     routesSection
                 }
-                Section {
+                Section("Fahrverhalten") {
                     DrivingBehaviorFields()
-                } header: {
-                    Text("Fahrverhalten")
-                } footer: {
-                    Text("Ampeln kommen aus OpenStreetMap. Ist der Dienst nicht erreichbar, hält die Route an echten Abbiegungen.")
                 }
-                Section("Mehr") {
-                    Button {
-                        onDraw()
-                    } label: {
-                        Label("Route selbst auf die Karte zeichnen", systemImage: "pencil.tip")
-                    }
-                    Button(action: onImportGPX) {
-                        Label("GPX importieren", systemImage: "square.and.arrow.down")
-                    }
-                    Button(action: onExportGPX) {
-                        Label("GPX exportieren", systemImage: "square.and.arrow.up")
-                    }
-                    if planner.destination != nil || !planner.candidates.isEmpty {
-                        Button("Route löschen", role: .destructive) {
-                            planner.clear()
-                        }
-                    }
+                if planner.mode == .route {
+                    moreSection
                 }
             }
-            .navigationTitle("Route planen")
+            .navigationTitle(planner.mode == .route ? "Route planen" : "Rundfahrt planen")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -277,6 +386,56 @@ struct RoutePlannerSheet: View {
                 planner.rebuild(session: session)
             }
         }
+    }
+
+    private var moreSection: some View {
+        Section("Mehr") {
+            Button {
+                onDraw()
+            } label: {
+                Label("Freihand zeichnen", systemImage: "pencil.tip")
+            }
+            Button(action: onImportGPX) {
+                Label("GPX importieren", systemImage: "square.and.arrow.down")
+            }
+            Button(action: onExportGPX) {
+                Label("GPX exportieren", systemImage: "square.and.arrow.up")
+            }
+            if planner.destination != nil || !planner.candidates.isEmpty {
+                Button("Route löschen", role: .destructive) {
+                    planner.clear()
+                }
+            }
+        }
+    }
+
+    private var cruiseSection: some View {
+        Section {
+            ForEach($planner.cruiseStops) { $stop in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(cruiseTitle(for: stop)).font(.caption).foregroundStyle(.secondary)
+                    Text(stop.name).lineLimit(1)
+                    Stepper(value: $stop.stayMinutes, in: 0...120, step: 1) {
+                        Text("Bleibt \(Int(stop.stayMinutes)) min").font(.footnote)
+                    }
+                }
+            }
+            .onDelete { planner.cruiseStops.remove(atOffsets: $0) }
+            if planner.cruiseStops.count < RoutePlannerModel.maxCruiseStops {
+                PlaceSearchField(prompt: "Ort hinzufügen") { name, coordinate in
+                    planner.addCruiseStop(name: name, coordinate: coordinate)
+                }
+            }
+        } header: {
+            Text("Punkte (\(planner.cruiseStops.count)/\(RoutePlannerModel.maxCruiseStops))")
+        } footer: {
+            Text("Start und bis zu 5 Punkte. Du fährst endlos zwischen ihnen hin und her, oft über dieselben Straßen, in leicht wechselnder Reihenfolge. Wischen löscht einen Punkt.")
+        }
+    }
+
+    private func cruiseTitle(for stop: CruiseStop) -> String {
+        let index = planner.cruiseStops.firstIndex { $0.id == stop.id } ?? 0
+        return index == 0 ? "Start" : "Punkt \(index)"
     }
 
     private var stopsSection: some View {
@@ -317,15 +476,8 @@ struct RoutePlannerSheet: View {
             PlaceSearchField(prompt: "Adresse oder Ort suchen") { name, coordinate in
                 planner.assign(searchSlot, name: name, coordinate: coordinate, session: session)
             }
-            Button {
-                onPickOnMap(.via)
-            } label: {
-                Label("Zwischenstopp auf der Karte setzen", systemImage: "plus.circle")
-            }
         } header: {
             Text("Wohin soll es gehen?")
-        } footer: {
-            Text("Suche eine Adresse oder tippe auf das Karten-Symbol und wähle den Punkt direkt auf der Karte.")
         }
     }
 
@@ -387,15 +539,16 @@ struct RoutePlannerSheet: View {
                     Text("Route wird berechnet…").foregroundStyle(.secondary)
                 }
             }
-            ForEach(planner.candidates) { candidate in
-                let length = RoutePath(candidate.coordinates).length
+            ForEach(Array(planner.candidates.enumerated()), id: \.element.id) { index, candidate in
                 Button {
                     planner.select(candidate, session: session)
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(candidate.title).foregroundStyle(.primary).lineLimit(1)
-                            Text("\(RouteFormat.distance(length)) • ca. \(RouteFormat.duration(length / session.routeSpeed))")
+                            Text(index == 0 ? "Empfohlen: \(candidate.title)" : candidate.title)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text("\(RouteFormat.distance(candidate.length)) • ca. \(RouteFormat.duration(candidate.length / session.routeSpeed))")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -406,31 +559,52 @@ struct RoutePlannerSheet: View {
                     }
                 }
             }
-            if !planner.signals.isEmpty {
-                Label("\(planner.signals.count) Ampeln & Stoppstellen auf der Route", systemImage: "light.beacon.max")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+            signalRow
         }
+    }
+
+    @ViewBuilder
+    private var signalRow: some View {
+        switch planner.signalState {
+        case .idle:
+            EmptyView()
+        case .loading:
+            Label("Suche Ampeln auf der Route…", systemImage: "hourglass")
+                .font(.footnote).foregroundStyle(.secondary)
+        case .found(let count):
+            Label("\(count) Ampeln & Stoppstellen gefunden", systemImage: "checkmark.circle")
+                .font(.footnote).foregroundStyle(.secondary)
+        case .unavailable:
+            Label("Ampel-Server nicht erreichbar, halte an Abbiegungen", systemImage: "exclamationmark.triangle")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    private var canStart: Bool {
+        planner.mode == .route ? planner.selected != nil : planner.cruiseStops.count >= 2
     }
 
     private var startButton: some View {
         Button {
-            planner.startDriving(session: session, pairing: pairing)
+            if planner.mode == .route {
+                planner.startDriving(session: session, pairing: pairing)
+            } else {
+                session.startCruise(planner.cruiseStops, pairing: pairing)
+            }
             dismiss()
         } label: {
-            Label("Route starten", systemImage: "play.fill")
+            Label(planner.mode == .route ? "Route starten" : "Rundfahrt starten", systemImage: "play.fill")
                 .font(.headline)
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(planner.selected == nil ? Color.gray : LocusTheme.accent)
+                        .fill(canStart ? LocusTheme.accent : Color.gray)
                 )
         }
         .buttonStyle(.plain)
-        .disabled(planner.selected == nil)
+        .disabled(!canStart)
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(.ultraThinMaterial)

@@ -204,6 +204,7 @@ struct BottomControlsView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                             .background(Capsule().fill(selected ? LocusTheme.accent : Color.clear))
+                            .overlay(Capsule().stroke(LocusTheme.panelStroke, lineWidth: 1))
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
@@ -285,6 +286,7 @@ struct BottomControlsView: View {
                         .padding(.vertical, 9)
                         .padding(.horizontal, 6)
                         .background(Capsule().fill(Color.primary.opacity(0.08)))
+                        .overlay(Capsule().stroke(LocusTheme.panelStroke, lineWidth: 1))
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -368,7 +370,15 @@ struct BottomControlsView: View {
                 Text(title).font(.caption2).lineLimit(1).minimumScaleFactor(0.8)
             }
             .foregroundStyle(active ? LocusTheme.accentSecondary : .primary)
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.primary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(active ? LocusTheme.accentSecondary : LocusTheme.panelStroke, lineWidth: 1)
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

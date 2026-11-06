@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
       - name: Build unsigned app
         run: |
           xcodebuild \
