@@ -9,11 +9,7 @@ struct MapHomeView: View {
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
-    @State private var routeStart: CLLocationCoordinate2D?
-    @State private var routeEnd: CLLocationCoordinate2D?
-    @State private var routeCoords: [CLLocationCoordinate2D] = []
-    @State private var isRouting = false
-    @State private var showRouteSheet = false
+    @StateObject private var planner = RoutePlannerModel()
     @State private var showGPXImporter = false
     @State private var drawnPath: [CLLocationCoordinate2D] = []
     @State private var drawMode = false
@@ -94,9 +90,34 @@ struct MapHomeView: View {
                             }
                         }
                     }
-                    if routeCoords.count > 1 {
-                        MapPolyline(coordinates: routeCoords)
-                            .stroke(LocusTheme.accent, lineWidth: 5)
+                    ForEach(planner.candidates.filter { $0.id != planner.selected?.id }) { candidate in
+                        MapPolyline(coordinates: candidate.coordinates)
+                            .stroke(.gray.opacity(0.6), lineWidth: 4)
+                    }
+                    if let route = planner.selected {
+                        MapPolyline(coordinates: route.coordinates)
+                            .stroke(LocusTheme.accent, lineWidth: 6)
+                    }
+                    ForEach(Array(planner.signals.enumerated()), id: \.offset) { _, signal in
+                        Annotation("", coordinate: signal) {
+                            Circle().fill(LocusTheme.statusBad).frame(width: 8, height: 8)
+                                .overlay(Circle().stroke(.white, lineWidth: 1))
+                        }
+                    }
+                    if let start = planner.start {
+                        Annotation("Start", coordinate: start.coordinate) {
+                            routeBadge("S", color: LocusTheme.statusGood)
+                        }
+                    }
+                    ForEach(Array(planner.vias.enumerated()), id: \.element.id) { index, via in
+                        Annotation(via.name, coordinate: via.coordinate) {
+                            routeBadge("\(index + 1)", color: LocusTheme.accentSecondary)
+                        }
+                    }
+                    if let destination = planner.destination {
+                        Annotation("Ziel", coordinate: destination.coordinate) {
+                            routeBadge("Z", color: LocusTheme.danger)
+                        }
                     }
                     if drawnPath.count > 1 {
                         MapPolyline(coordinates: drawnPath)
@@ -134,28 +155,45 @@ struct MapHomeView: View {
                 importGPX(url)
             }
         }
-        .sheet(isPresented: $showRouteSheet) {
+        .sheet(isPresented: $session.showRoutePlanner) {
             RoutePlannerSheet(
-                start: $routeStart,
-                end: $routeEnd,
-                isRouting: $isRouting,
-                onBuild: buildRoadRoute,
-                onPlay: playRoute,
+                planner: planner,
+                onPickOnMap: { slot in
+                    planner.pickingSlot = slot
+                    session.showRoutePlanner = false
+                },
+                onDraw: {
+                    drawMode = true
+                    session.showRoutePlanner = false
+                },
                 onImportGPX: { showGPXImporter = true },
-                onExportGPX: exportGPX,
-                onUseDrawn: {
-                    routeCoords = RouteBuilder.sample(coordinates: drawnPath, every: 10)
-                    drawnPath.removeAll()
-                    drawMode = false
-                }
+                onExportGPX: exportGPX
             )
             .presentationDetents([.medium, .large])
+            .presentationBackgroundInteraction(.enabled(upThrough: .medium))
         }
+    }
+
+    private func routeBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.white)
+            .frame(width: 26, height: 26)
+            .background(Circle().fill(color))
+            .overlay(Circle().stroke(.white, lineWidth: 2))
+    }
+
+    private func coordinateLabel(_ coordinate: CLLocationCoordinate2D) -> String {
+        String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
     }
 
     private func placePin(at point: CGPoint, proxy: MapProxy) {
         guard let coord = proxy.convert(point, from: .local) else { return }
-        if drawMode {
+        if let slot = planner.pickingSlot {
+            planner.pickingSlot = nil
+            planner.assign(slot, name: coordinateLabel(coord), coordinate: coord, session: session)
+            session.showRoutePlanner = true
+        } else if drawMode {
             drawnPath.append(coord)
         } else {
             session.pin = coord
@@ -176,8 +214,35 @@ struct MapHomeView: View {
 
             HStack(alignment: .center, spacing: 10) {
                 mapChromeButtons
-                Spacer(minLength: 0)
+                Text("LocationLarper by yungmiami")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .shadow(color: .black.opacity(0.7), radius: 2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .frame(maxWidth: .infinity)
                 locateButton
+            }
+
+            if let banner = mapBanner {
+                HStack(spacing: 10) {
+                    Text(banner)
+                        .font(.footnote.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if drawMode {
+                        Button("Fertig") { finishDrawing() }
+                            .font(.footnote.weight(.bold))
+                    }
+                    Button("Abbrechen") {
+                        planner.pickingSlot = nil
+                        drawMode = false
+                        drawnPath.removeAll()
+                        session.showRoutePlanner = true
+                    }
+                    .font(.footnote.weight(.semibold))
+                }
+                .padding(12)
+                .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
         .padding(.horizontal, 16)
@@ -185,11 +250,26 @@ struct MapHomeView: View {
         .safeAreaPadding(.top, 8)
     }
 
+    private var mapBanner: String? {
+        if let slot = planner.pickingSlot {
+            return "Tippe auf die Karte: \(slot.title) setzen"
+        }
+        return drawMode ? "Tippe nacheinander die Punkte deiner Route" : nil
+    }
+
+    private func finishDrawing() {
+        let path = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+        drawMode = false
+        drawnPath.removeAll()
+        planner.useCustomPath(path, title: "Gezeichnete Route", session: session)
+        session.showRoutePlanner = true
+    }
+
     private var searchBar: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("Search places", text: $searchText)
+            TextField("Ort oder Adresse suchen", text: $searchText)
                 .textInputAutocapitalization(.words)
                 .focused($searchFocused)
                 .submitLabel(.search)
@@ -212,7 +292,7 @@ struct MapHomeView: View {
                 .accessibilityLabel("Clear and dismiss keyboard")
             }
             if searchFocused {
-                Button("Done") {
+                Button("Fertig") {
                     searchFocused = false
                 }
                 .font(.subheadline.weight(.semibold))
@@ -255,15 +335,6 @@ struct MapHomeView: View {
             chromeIconButton("square.3.layers.3d") {
                 session.mapStyleIndex = (session.mapStyleIndex + 1) % 3
             }
-            chromeIconButton("point.topleft.down.to.point.bottomright.curvepath") {
-                showRouteSheet = true
-            }
-            chromeIconButton(drawMode ? "pencil.tip.crop.circle.badge.minus" : "pencil.tip.crop.circle") {
-                drawMode.toggle()
-                if !drawMode { drawnPath.removeAll() }
-            }
-            .foregroundStyle(drawMode ? LocusTheme.accentSecondary : .primary)
-
             if session.pin != nil {
                 chromeIconButton("star.circle") {
                     if let pin = session.pin {
@@ -357,43 +428,10 @@ struct MapHomeView: View {
         }
     }
 
-    private func buildRoadRoute() {
-        guard let start = routeStart ?? session.simulated ?? session.pin,
-              let end = routeEnd else {
-            session.lastError = "Set a route start and end."
-            return
-        }
-        isRouting = true
-        Task {
-            do {
-                let coords = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
-                await MainActor.run {
-                    routeCoords = coords
-                    isRouting = false
-                }
-            } catch {
-                await MainActor.run {
-                    isRouting = false
-                    session.lastError = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private func playRoute() {
-        let path = routeCoords.isEmpty ? drawnPath : routeCoords
-        guard path.count >= 2 else {
-            session.lastError = "Build or draw a route first."
-            return
-        }
-        showRouteSheet = false
-        session.followRoute(path, pairing: pairing)
-    }
-
     private func importGPX(_ url: URL) {
         do {
             let coords = try GPXCodec.parse(url)
-            routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
+            planner.useCustomPath(RouteBuilder.sample(coordinates: coords, every: 10), title: "GPX-Route", session: session)
             if let first = coords.first {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
@@ -404,13 +442,13 @@ struct MapHomeView: View {
     }
 
     private func exportGPX() {
-        let path = routeCoords.isEmpty ? drawnPath : routeCoords
+        let path = planner.selected?.coordinates ?? drawnPath
         guard !path.isEmpty else {
-            session.lastError = "Nothing to export."
+            session.lastError = "Es gibt noch keine Route zum Exportieren."
             return
         }
         let gpx = GPXCodec.export(path)
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Locus-Route.gpx")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("LocationLarper-Route.gpx")
         do {
             try gpx.data(using: .utf8)?.write(to: url)
             let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)

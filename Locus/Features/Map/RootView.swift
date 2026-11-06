@@ -36,7 +36,7 @@ struct RootView: View {
         .sheet(isPresented: $showPlaces) {
             PlacesView()
         }
-        .alert("Locus", isPresented: Binding(
+        .alert("Location Larper", isPresented: Binding(
             get: { session.lastError != nil },
             set: { if !$0 { session.lastError = nil } }
         )) {
@@ -64,13 +64,13 @@ struct StatusBarView: View {
         case .idle:
             return tunnelConnected ? .notSpoofing : .connectVPN
         case .connecting:
-            return .status("Connecting…")
+            return .status("Wird gestartet…")
         case .active:
-            return .status("Spoofing")
+            return .status("Standort simuliert")
         case .reconnecting:
-            return .status("Reconnecting…")
+            return .status("Verbindet neu…")
         case .dropped(let reason):
-            return .status(reason.isEmpty ? "Disconnected" : "Disconnected — \(reason)")
+            return .status(reason.isEmpty ? "Unterbrochen" : "Unterbrochen: \(reason)")
         }
     }
 
@@ -92,8 +92,8 @@ struct StatusBarView: View {
 
     private var title: String {
         switch display {
-        case .notSpoofing: return "Not Spoofing"
-        case .connectVPN: return "Connect LocalDevVPN"
+        case .notSpoofing: return "Echter Standort"
+        case .connectVPN: return "LocalDevVPN verbinden"
         case .status(let text): return text
         }
     }
@@ -174,7 +174,7 @@ struct BottomControlsView: View {
     private let trayShape = RoundedRectangle(cornerRadius: 28, style: .continuous)
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             if session.joystickActive {
                 JoystickPad { vector in
                     session.updateJoystick(vector: vector)
@@ -183,135 +183,197 @@ struct BottomControlsView: View {
                 .frame(maxWidth: .infinity, alignment: .trailing)
             }
 
-            HStack(spacing: 8) {
+            if let progress = session.routeProgress {
+                routeStatus(progress)
+            } else if let hint {
+                Text(hint)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 6) {
                 ForEach(TravelMode.allCases) { mode in
                     let selected = session.travelMode == mode
                     Button {
                         session.travelMode = mode
                     } label: {
-                        Image(systemName: mode.icon)
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(selected ? .black : .primary)
-                            .frame(width: 44, height: 40)
-                            .background(
-                                Capsule().fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08))
-                            )
-                            .contentShape(Capsule())
+                        VStack(spacing: 2) {
+                            Image(systemName: mode.icon).font(.footnote.weight(.semibold))
+                            Text(mode.title).font(.caption2.weight(.semibold)).lineLimit(1)
+                        }
+                        .foregroundStyle(selected ? .black : .primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08))
+                        )
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
-                Spacer(minLength: 0)
-
-                if session.customSpeedEnabled {
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Text(String(format: "%.0f km/h", session.customSpeedKmh))
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                            .fixedSize()
-                            .foregroundStyle(.black)
-                            .padding(.horizontal, 10)
-                            .frame(height: 40)
-                            .background(Capsule().fill(LocusTheme.accentSecondary))
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Custom speed")
-                }
-
-                Button {
-                    session.goHome(pairing: pairing)
-                } label: {
-                    Image(systemName: "house.fill")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 44, height: 40)
-                        .background(Capsule().fill(Color.primary.opacity(0.08)))
-                        .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.primary)
-                .disabled(session.isBusy)
-                .accessibilityLabel("Go Home")
             }
 
-            HStack(spacing: 10) {
-                trayIcon("gearshape.fill") { showSettings = true }
-                trayIcon("star.fill") { showPlaces = true }
+            if !session.shortcuts.isEmpty || canAddShortcut {
+                shortcutRow
+            }
 
-                Button {
+            HStack(spacing: 8) {
+                if showsTeleport {
+                    primaryButton(session.canRestore ? "Hierhin" : "Hierhin teleportieren", color: LocusTheme.accent, foreground: .black) {
+                        if let pin = session.pin {
+                            session.teleport(to: pin, pairing: pairing)
+                        }
+                    }
+                    .disabled(session.isBusy)
+                }
+                if session.canRestore {
+                    primaryButton("Echten Standort zurück", color: LocusTheme.danger, foreground: .white) {
+                        session.stop(pairing: pairing)
+                    }
+                }
+            }
+
+            HStack(spacing: 4) {
+                tile("Route", "point.topleft.down.to.point.bottomright.curvepath") {
+                    session.showRoutePlanner = true
+                }
+                tile("Zuhause", "house.fill") {
+                    session.goHome(pairing: pairing)
+                }
+                tile("Joystick", "dot.circle.and.hand.point.up.left.fill", active: session.joystickActive) {
                     if session.joystickActive {
                         session.stopJoystick()
                     } else {
                         session.startJoystick(pairing: pairing)
                     }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "dot.circle.and.hand.point.up.left.fill")
-                        Text(session.joystickActive ? "On" : "Joy")
-                            .lineLimit(1)
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(session.joystickActive ? .black : .primary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(
-                        Capsule().fill(session.joystickActive ? LocusTheme.accentSecondary : Color.primary.opacity(0.08))
-                    )
-                    .contentShape(Capsule())
                 }
-                .buttonStyle(.plain)
-
-                if session.canRestore {
-                    Button {
-                        session.stop(pairing: pairing)
-                    } label: {
-                        Text("Stop")
-                            .font(.subheadline.weight(.bold))
-                            .foregroundStyle(.white)
-                            .frame(minWidth: 72)
-                            .padding(.vertical, 12)
-                            .padding(.horizontal, 8)
-                            .background(Capsule().fill(LocusTheme.danger))
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    Button {
-                        guard let pin = session.pin else {
-                            session.lastError = "Tap the map to drop a pin first."
-                            return
-                        }
-                        session.teleport(to: pin, pairing: pairing)
-                    } label: {
-                        Text("Teleport")
-                            .font(.subheadline.weight(.bold))
-                            .foregroundStyle(.black)
-                            .frame(minWidth: 96)
-                            .padding(.vertical, 12)
-                            .padding(.horizontal, 10)
-                            .background(Capsule().fill(LocusTheme.accent))
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(session.isBusy)
-                }
+                tile("Orte", "star.fill") { showPlaces = true }
+                tile("Optionen", "gearshape.fill") { showSettings = true }
             }
         }
-        .padding(14)
+        .padding(12)
         .locusGlass(.regular, in: trayShape)
         // Whole tray absorbs taps so near-misses don't fall through to the map.
         .contentShape(trayShape)
     }
 
-    private func trayIcon(_ systemName: String, action: @escaping () -> Void) -> some View {
+    private var hint: String? {
+        if session.isPlanningRoute { return "Route wird berechnet…" }
+        if session.canRestore { return nil }
+        return session.pin == nil ? "Tippe auf die Karte, um einen Ort zu wählen." : nil
+    }
+
+    private var showsTeleport: Bool {
+        guard let pin = session.pin else { return false }
+        guard let simulated = session.simulated else { return true }
+        return abs(pin.latitude - simulated.latitude) > 0.00001 || abs(pin.longitude - simulated.longitude) > 0.00001
+    }
+
+    private var canAddShortcut: Bool {
+        session.pin != nil && session.shortcuts.count < SpoofSession.maxShortcuts
+    }
+
+    private var shortcutRow: some View {
+        HStack(spacing: 6) {
+            ForEach(session.shortcuts) { place in
+                Button {
+                    session.drive(to: place, pairing: pairing)
+                } label: {
+                    Label(place.name, systemImage: "car.fill")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .padding(.horizontal, 6)
+                        .background(Capsule().fill(Color.primary.opacity(0.08)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(session.isBusy || session.isPlanningRoute)
+                .accessibilityLabel("Mit 20 km/h zu \(place.name) fahren")
+            }
+            if canAddShortcut, let pin = session.pin {
+                Button {
+                    session.addShortcut(name: session.suggestedFavoriteName(for: pin), coordinate: pin)
+                } label: {
+                    Label("Shortcut", systemImage: "plus")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                        .padding(.vertical, 9)
+                        .padding(.horizontal, 10)
+                        .background(Capsule().stroke(Color.primary.opacity(0.2)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Aktuellen Pin als Shortcut speichern")
+            }
+        }
+    }
+
+    private func routeStatus(_ progress: RouteProgress) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(progress.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text("Noch \(RouteFormat.distance(progress.remaining)) • ca. \(RouteFormat.duration(progress.remainingTime)) • \(Int(progress.speedKmh)) km/h")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                ProgressView(value: progress.fraction)
+                    .tint(LocusTheme.accent)
+            }
+            Button {
+                session.routePaused.toggle()
+            } label: {
+                Image(systemName: session.routePaused ? "play.fill" : "pause.fill")
+                    .frame(width: 40, height: 40)
+                    .background(Circle().fill(Color.primary.opacity(0.08)))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(session.routePaused ? "Route fortsetzen" : "Route pausieren")
+            Button {
+                session.cancelRoute()
+            } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 40, height: 40)
+                    .background(Circle().fill(Color.primary.opacity(0.08)))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Route beenden und hier bleiben")
+        }
+    }
+
+    private func primaryButton(_ title: String, color: Color, foreground: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: systemName)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 44, height: 44)
-                .background(Circle().fill(Color.primary.opacity(0.08)))
-                .contentShape(Circle())
+            Text(title)
+                .font(.subheadline.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .foregroundStyle(foreground)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(Capsule().fill(color))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func tile(_ title: String, _ systemName: String, active: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemName).font(.body.weight(.semibold))
+                Text(title).font(.caption2).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(active ? LocusTheme.accentSecondary : .primary)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }

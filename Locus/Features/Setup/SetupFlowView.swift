@@ -96,7 +96,7 @@ struct SetupFlowView: View {
             )
             .ignoresSafeArea()
         }
-        .alert("Locus", isPresented: Binding(
+        .alert("Location Larper", isPresented: Binding(
             get: { session.lastError != nil },
             set: { if !$0 { session.lastError = nil } }
         )) {
@@ -182,7 +182,7 @@ struct SetupFlowView: View {
                     .scaleEffect(appear ? 1 : 0.85)
 
                 VStack(spacing: 10) {
-                    Text("Locus")
+                    Text("Location Larper")
                         .font(.system(size: 48, weight: .bold, design: .rounded))
                         .tracking(-0.5)
 
@@ -223,8 +223,8 @@ struct SetupFlowView: View {
                 Text("Connect this iPhone")
                     .font(.title.weight(.bold))
                 Text(supportsOnDevicePairing
-                     ? "Locus needs a one-time pairing so it can set your location. You’ll confirm a short code in Settings."
-                     : "Import a pairing file from your computer — Locus uses it to set your location securely on this device.")
+                     ? "Location Larper needs a one-time pairing so it can set your location. You’ll confirm a short code in Settings."
+                     : "Import a pairing file from your computer — Location Larper uses it to set your location securely on this device.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -273,7 +273,7 @@ struct SetupFlowView: View {
     private var importPairingCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             stepRow(1, "On a Mac, run idevice_pair and create an RPPairing file.")
-            stepRow(2, "AirDrop / Share into Locus, or copy the plist text.")
+            stepRow(2, "AirDrop / Share into Location Larper, or copy the plist text.")
             stepRow(3, "Tap Import, or Paste from clipboard if the picker doesn’t work (LiveContainer).")
         }
         .padding(18)
@@ -311,8 +311,8 @@ struct SetupFlowView: View {
                         .font(.title.weight(.bold))
 
                     Text(localDevVPNInstalled
-                         ? "LocalDevVPN is installed. Open it to turn on the private tunnel Locus needs, then come back here."
-                         : "LocalDevVPN creates a private tunnel Locus uses to talk to your phone’s location system. Install it, turn it on, then you’re ready to teleport.")
+                         ? "LocalDevVPN is installed. Open it to turn on the private tunnel Location Larper needs, then come back here."
+                         : "LocalDevVPN creates a private tunnel Location Larper uses to talk to your phone’s location system. Install it, turn it on, then you’re ready to teleport.")
                         .font(.body)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -322,7 +322,7 @@ struct SetupFlowView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     if localDevVPNInstalled {
                         tipRow(systemImage: "checkmark.circle.fill", title: "Installed", detail: "LocalDevVPN is on this iPhone.")
-                        tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Tap below to open it and start the tunnel. You’ll bounce back to Locus.")
+                        tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Tap below to open it and start the tunnel. You’ll bounce back to Location Larper.")
                     } else {
                         tipRow(systemImage: "arrow.down.app.fill", title: "Install", detail: "Get LocalDevVPN from the App Store.")
                         tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Open it and turn the VPN on. Leave the default IP alone.")

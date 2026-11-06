@@ -1,4 +1,3 @@
-import MapKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -9,12 +8,11 @@ struct SettingsView: View {
 
     @State private var showImporter = false
     @State private var showPairOnDevice = false
-    @State private var showNameEasterEgg = false
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
-    @StateObject private var homeSearch = PlaceSearchCompleter()
-    @State private var homeQuery = ""
     @State private var speedText = ""
+    @State private var shortcutToRename: SavedPlace?
+    @State private var shortcutName = ""
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -64,8 +62,8 @@ struct SettingsView: View {
                     Text("Developer pairing")
                 } footer: {
                     Text(supportsOnDevicePairing
-                         ? "On iOS 27, use Pair on this iPhone — no computer. Locus advertises a pairable host; confirm the 6-digit code under Settings › Privacy & Security › Developer Mode › Pair with Host. On older iOS, import an RPPairing file from idevice_pair (not a SideStore lockdown .mobiledevicepairing). LiveContainer: enable Fix File Picker on Locus, or use Paste / Share → LiveContainer → Locus."
-                         : "Import an RPPairing file from idevice_pair (not a SideStore lockdown .mobiledevicepairing). If the file picker fails (common in LiveContainer), enable Fix File Picker on the app, share the file into LiveContainer → Locus, or copy the plist and use Paste.")
+                         ? "On iOS 27, use Pair on this iPhone — no computer. Location Larper advertises a pairable host; confirm the 6-digit code under Settings › Privacy & Security › Developer Mode › Pair with Host. On older iOS, import an RPPairing file from idevice_pair (not a SideStore lockdown .mobiledevicepairing). LiveContainer: enable Fix File Picker on Location Larper, or use Paste / Share → LiveContainer → Location Larper."
+                         : "Import an RPPairing file from idevice_pair (not a SideStore lockdown .mobiledevicepairing). If the file picker fails (common in LiveContainer), enable Fix File Picker on the app, share the file into LiveContainer → Location Larper, or copy the plist and use Paste.")
                 }
 
                 Section {
@@ -102,51 +100,61 @@ struct SettingsView: View {
 
                 Section {
                     if let home = session.home {
-                        LabeledContent("Home", value: home.name)
+                        LabeledContent("Zuhause", value: home.name)
                     }
-                    TextField("Search address", text: $homeQuery)
-                        .textInputAutocapitalization(.words)
-                        .autocorrectionDisabled()
-                        .onChange(of: homeQuery) { _, value in
-                            homeSearch.query = value
-                        }
-                    if !homeQuery.isEmpty {
-                        ForEach(homeSearch.results.prefix(5), id: \.self) { item in
-                            Button {
-                                selectHome(item)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.title).foregroundStyle(.primary)
-                                    if !item.subtitle.isEmpty {
-                                        Text(item.subtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
+                    PlaceSearchField(prompt: "Adresse suchen") { name, coordinate in
+                        session.setHome(name: name, coordinate: coordinate)
                     }
                     if let pin = session.pin {
-                        Button("Use current pin as Home") {
+                        Button("Aktuellen Pin als Zuhause speichern") {
                             session.setHome(name: session.suggestedFavoriteName(for: pin), coordinate: pin)
                         }
                     }
                     if session.home != nil {
-                        Button("Remove Home", role: .destructive) {
+                        Button("Zuhause entfernen", role: .destructive) {
                             session.removeHome()
                         }
                     }
                 } header: {
-                    Text("Home")
+                    Text("Zuhause")
                 } footer: {
-                    Text("The house button on the map teleports you here. Use Stop to restore your real location.")
+                    Text("Der Button Zuhause teleportiert dich direkt dorthin. Dein echter Standort kommt erst mit Echter Standort zurück.")
                 }
 
                 Section {
-                    Toggle("Custom speed", isOn: $session.customSpeedEnabled)
+                    ForEach(session.shortcuts) { place in
+                        Text(place.name)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    session.removeShortcut(place)
+                                } label: {
+                                    Label("Löschen", systemImage: "trash.fill")
+                                }
+                                Button {
+                                    shortcutToRename = place
+                                    shortcutName = place.name
+                                } label: {
+                                    Label("Umbenennen", systemImage: "pencil")
+                                }
+                                .tint(.gray)
+                            }
+                    }
+                    if session.shortcuts.count < SpoofSession.maxShortcuts {
+                        PlaceSearchField(prompt: "Ort für neuen Shortcut suchen") { name, coordinate in
+                            session.addShortcut(name: name, coordinate: coordinate)
+                        }
+                    }
+                } header: {
+                    Text("Shortcuts (\(session.shortcuts.count)/\(SpoofSession.maxShortcuts))")
+                } footer: {
+                    Text("Shortcuts erscheinen unten auf der Karte. Beim Antippen fährst du mit 20 km/h die Route dorthin und bleibst am Ziel simuliert. Zum Bearbeiten nach links wischen.")
+                }
+
+                Section {
+                    Toggle("Eigenes Tempo", isOn: $session.customSpeedEnabled)
                     if session.customSpeedEnabled {
                         Slider(value: $session.customSpeedKmh, in: SpoofSession.customSpeedRange, step: 1)
-                        LabeledContent("Speed") {
+                        LabeledContent("Tempo") {
                             HStack(spacing: 4) {
                                 TextField("30", text: $speedText)
                                     .keyboardType(.decimalPad)
@@ -163,45 +171,34 @@ struct SettingsView: View {
                         }
                     }
                 } header: {
-                    Text("Speed")
+                    Text("Tempo")
                 } footer: {
-                    Text("Overrides the travel modes for routes and the joystick. 1–500 km/h, without random variation.")
+                    Text("Gilt für Routen und Joystick, 1 bis 500 km/h. Shortcuts fahren immer 20 km/h.")
                 }
 
-                Section("Privacy") {
-                    Text("Fully on-device. Favorites and recents stay in UserDefaults. No analytics, no accounts, nothing uploaded.")
+                Section("Fahrverhalten") {
+                    DrivingBehaviorFields()
+                }
+
+                Section("Datenschutz") {
+                    Text("Orte bleiben auf dem iPhone. Keine Analyse, kein Konto. Nur beim Planen wird der Routenverlauf an OpenStreetMap geschickt, um Ampeln zu finden.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("About") {
+                Section("Über die App") {
                     LabeledContent("Version", value: appVersion)
                     LabeledContent("Engine", value: "idevice DVT location simulation")
-                    Text("Locus is free and open source (MIT). Location injection uses the MIT-licensed idevice FFI.")
+                    Text("Location Larper by yungmiami. Basiert auf Location Larper von ChrisMack32 (MIT), Standort über idevice (MIT).")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
-                Section {
-                    Button {
-                        showNameEasterEgg = true
-                    } label: {
-                        Text("locus, n. — a place. From the Latin for where you are.")
-                            .font(.footnote.italic())
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("Optionen")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
+                    Button("Fertig") {
                         TunnelConfig.setTargetIP(tunnelIP)
                         dismiss()
                     }
@@ -225,8 +222,18 @@ struct SettingsView: View {
                 PairOnDeviceView()
                     .environmentObject(pairing)
             }
-            .fullScreenCover(isPresented: $showNameEasterEgg) {
-                LocusEasterEggView()
+            .alert("Shortcut umbenennen", isPresented: Binding(
+                get: { shortcutToRename != nil },
+                set: { if !$0 { shortcutToRename = nil } }
+            )) {
+                TextField("Name", text: $shortcutName)
+                Button("Abbrechen", role: .cancel) { shortcutToRename = nil }
+                Button("Speichern") {
+                    if let place = shortcutToRename {
+                        session.renameShortcut(place, to: shortcutName)
+                    }
+                    shortcutToRename = nil
+                }
             }
             .onAppear {
                 localDevVPNInstalled = LocalDevVPN.isInstalled
@@ -252,25 +259,6 @@ struct SettingsView: View {
     private func formattedSpeed(_ speed: Double) -> String {
         speed.rounded() == speed ? String(format: "%.0f", speed) : String(format: "%.1f", speed)
     }
-
-    private func selectHome(_ completion: MKLocalSearchCompletion) {
-        Task {
-            let request = MKLocalSearch.Request(completion: completion)
-            guard let response = try? await MKLocalSearch(request: request).start(),
-                  let item = response.mapItems.first else {
-                await MainActor.run {
-                    session.lastError = "Could not find that address."
-                }
-                return
-            }
-            let coord = item.placemark.coordinate
-            let name = completion.subtitle.isEmpty ? completion.title : "\(completion.title), \(completion.subtitle)"
-            await MainActor.run {
-                session.setHome(name: name, coordinate: coord)
-                homeQuery = ""
-            }
-        }
-    }
 }
 
 struct PlacesView: View {
@@ -284,9 +272,9 @@ struct PlacesView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Favorites") {
+                Section("Favoriten") {
                     if session.favorites.isEmpty {
-                        Text("Star a pin from the map to save it.")
+                        Text("Tippe auf der Karte auf den Stern, um einen Pin zu speichern.")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(session.favorites) { place in
@@ -308,9 +296,9 @@ struct PlacesView: View {
                     }
                 }
 
-                Section("Recents") {
+                Section("Zuletzt") {
                     if session.recents.isEmpty {
-                        Text("Teleports show up here.")
+                        Text("Hier erscheinen deine letzten Orte.")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(session.recents) { place in
@@ -325,10 +313,10 @@ struct PlacesView: View {
                     }
                 }
             }
-            .navigationTitle("Places")
+            .navigationTitle("Orte")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Fertig") { dismiss() }
                 }
             }
             .alert("Rename Favorite", isPresented: Binding(

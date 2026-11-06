@@ -102,13 +102,13 @@ final class PairOnDeviceService: ObservableObject {
             minVer: minVer
         )
         phase = .advertising
-        NSLog("[Locus] listening on %u, Bonjour id=%@", port, serviceIdentifier)
+        NSLog("[Location Larper] listening on %u, Bonjour id=%@", port, serviceIdentifier)
     }
 
     fileprivate func handleConnected() {
         phase = .deviceConnected
         Self.postPlainNotification(
-            title: "Locus connected",
+            title: "Location Larper connected",
             body: "Generating pairing code…"
         )
     }
@@ -125,7 +125,7 @@ final class PairOnDeviceService: ObservableObject {
         phase = .succeeded
         teardown()
         Self.postPlainNotification(
-            title: "Locus paired",
+            title: "Location Larper paired",
             body: "RPPairing is ready. Connect LocalDevVPN, then teleport."
         )
     }
@@ -166,7 +166,7 @@ final class PairOnDeviceService: ObservableObject {
 
     private static func postPINNotification(_ pin: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Locus pairing code"
+        content.title = "Location Larper pairing code"
         content.body = pin
         content.sound = .default
         if #available(iOS 15.0, *) {
@@ -186,7 +186,7 @@ final class PairOnDeviceService: ObservableObject {
     }
 
     private static func runBlockingAccept(outputPath: String, box: PairCallbackBox) {
-        let name = "Locus"
+        let name = "Location Larper"
         let model = "Mac17,7"
 
         var outFile: OpaquePointer?
@@ -304,7 +304,7 @@ private func listeningTrampoline(
     let values = (
         port,
         serviceIdentifier.map { String(cString: $0) } ?? "",
-        name.map { String(cString: $0) } ?? "Locus",
+        name.map { String(cString: $0) } ?? "Location Larper",
         model.map { String(cString: $0) } ?? "Mac17,7",
         authTag.map { String(cString: $0) } ?? "",
         ver.map { String(cString: $0) } ?? "26",

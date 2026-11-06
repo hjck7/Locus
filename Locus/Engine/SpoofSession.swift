@@ -5,6 +5,65 @@ import SwiftUI
 import UIKit
 import UserNotifications
 
+enum StopFrequency: Int, CaseIterable, Identifiable {
+    case off, rare, normal, often
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "Nie"
+        case .rare: return "Selten"
+        case .normal: return "Normal"
+        case .often: return "Oft"
+        }
+    }
+
+    /// Chance that a traffic light on the route is red.
+    var chance: Double {
+        switch self {
+        case .off: return 0
+        case .rare: return 0.2
+        case .normal: return 0.45
+        case .often: return 0.75
+        }
+    }
+}
+
+enum StopDuration: Int, CaseIterable, Identifiable {
+    case short, normal, long
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .short: return "Kurz (5–15 s)"
+        case .normal: return "Normal (10–30 s)"
+        case .long: return "Lang (20–60 s)"
+        }
+    }
+
+    var seconds: ClosedRange<Int> {
+        switch self {
+        case .short: return 5...15
+        case .normal: return 10...30
+        case .long: return 20...60
+        }
+    }
+}
+
+struct RouteProgress: Equatable {
+    var title: String
+    var travelled: CLLocationDistance
+    var total: CLLocationDistance
+    var speedKmh: Double
+    var cruiseSpeed: CLLocationSpeed
+
+    var remaining: CLLocationDistance { max(total - travelled, 0) }
+    var remainingTime: TimeInterval { remaining / max(cruiseSpeed, 0.1) }
+    var fraction: Double { total > 0 ? min(travelled / total, 1) : 0 }
+}
+
 enum TravelMode: String, CaseIterable, Identifiable {
     case walk, run, cycle, drive
 
@@ -12,10 +71,10 @@ enum TravelMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .walk: return "Walk"
-        case .run: return "Run"
-        case .cycle: return "Cycle"
-        case .drive: return "Drive"
+        case .walk: return "Gehen"
+        case .run: return "Joggen"
+        case .cycle: return "Rad"
+        case .drive: return "Auto"
         }
     }
 
@@ -55,11 +114,11 @@ enum SpoofStatus: Equatable {
 
     var label: String {
         switch self {
-        case .idle: return "Not Spoofing"
-        case .connecting: return "Starting…"
-        case .active: return "Spoofing"
-        case .reconnecting: return "Reconnecting…"
-        case .dropped: return "Interrupted"
+        case .idle: return "Echter Standort"
+        case .connecting: return "Wird gestartet…"
+        case .active: return "Standort simuliert"
+        case .reconnecting: return "Verbindet neu…"
+        case .dropped: return "Unterbrochen"
         }
     }
 
@@ -81,6 +140,21 @@ final class SpoofSession: ObservableObject {
     @Published var joystickActive = false
     /// Bumped when the map should recenter, e.g. on the real position after a restore.
     @Published private(set) var recenterRevision = 0
+    @Published var showRoutePlanner = false
+    @Published private(set) var routeProgress: RouteProgress?
+    @Published private(set) var isPlanningRoute = false
+    @Published var routePaused = false
+    @Published private(set) var shortcuts: [SavedPlace] = []
+    @Published var stopFrequency = StopFrequency.normal {
+        didSet { UserDefaults.standard.set(stopFrequency.rawValue, forKey: stopFrequencyKey) }
+    }
+    @Published var stopDuration = StopDuration.normal {
+        didSet { UserDefaults.standard.set(stopDuration.rawValue, forKey: stopDurationKey) }
+    }
+    /// Seconds between location updates while moving.
+    @Published var updateInterval: TimeInterval = 1 {
+        didSet { UserDefaults.standard.set(updateInterval, forKey: updateIntervalKey) }
+    }
 
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
@@ -105,6 +179,7 @@ final class SpoofSession: ObservableObject {
     private var routeTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var resendInFlight = false
+    private var joystickStep: TimeInterval = 0.25
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
     private var joystickVector: CGVector = .zero
     private let locationKeeper = BackgroundKeepAlive()
@@ -115,14 +190,33 @@ final class SpoofSession: ObservableObject {
     private let activeSimulationKey = "locus.activeSimulation"
     private let customSpeedEnabledKey = "locus.customSpeedEnabled"
     private let customSpeedKey = "locus.customSpeedKmh"
+    private let shortcutsKey = "locus.shortcuts"
+    private let stopFrequencyKey = "locus.stopFrequency"
+    private let stopDurationKey = "locus.stopDuration"
+    private let updateIntervalKey = "locus.updateInterval"
 
     static let customSpeedRange: ClosedRange<Double> = 1...500
+    static let updateIntervalRange: ClosedRange<TimeInterval> = 0.2...5
+    static let maxShortcuts = 3
+    static let shortcutSpeedKmh = 20.0
     private static let defaultCustomSpeedKmh = 30.0
 
     init() {
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
         home = SavedPlace.load(key: homeKey).first
+        shortcuts = Array(SavedPlace.load(key: shortcutsKey).prefix(Self.maxShortcuts))
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: stopFrequencyKey) != nil {
+            stopFrequency = StopFrequency(rawValue: defaults.integer(forKey: stopFrequencyKey)) ?? .normal
+        }
+        if defaults.object(forKey: stopDurationKey) != nil {
+            stopDuration = StopDuration(rawValue: defaults.integer(forKey: stopDurationKey)) ?? .normal
+        }
+        if defaults.object(forKey: updateIntervalKey) != nil {
+            let stored = defaults.double(forKey: updateIntervalKey)
+            updateInterval = min(max(stored, Self.updateIntervalRange.lowerBound), Self.updateIntervalRange.upperBound)
+        }
         customSpeedEnabled = UserDefaults.standard.bool(forKey: customSpeedEnabledKey)
         if UserDefaults.standard.object(forKey: customSpeedKey) != nil {
             customSpeedKmh = UserDefaults.standard.double(forKey: customSpeedKey)
@@ -145,21 +239,21 @@ final class SpoofSession: ObservableObject {
         customSpeedEnabled ? customSpeedKmh / 3.6 : travelMode.baseSpeed
     }
 
+    var routeSpeed: CLLocationSpeed { activeSpeed }
+
     func teleport(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
         guard pairing.hasPairingFile else {
-            lastError = "Import an RPPairing file in Settings first."
+            lastError = "Richte zuerst die Kopplung in den Optionen ein."
             return
         }
-        routeTask?.cancel()
-        routeTask = nil
+        cancelRoute()
         stopJoystick()
         pin = coordinate
         apply(coordinate, pairing: pairing, markRecent: true)
     }
 
     func stop(pairing: PairingStore) {
-        routeTask?.cancel()
-        routeTask = nil
+        cancelRoute()
         reconnectTask?.cancel()
         reconnectTask = nil
         stopJoystick()
@@ -224,7 +318,7 @@ final class SpoofSession: ObservableObject {
 
     func goHome(pairing: PairingStore) {
         guard let home else {
-            lastError = "Set a Home address in Settings first."
+            lastError = "Lege zuerst in den Optionen dein Zuhause fest."
             return
         }
         teleport(to: home.coordinate, pairing: pairing)
@@ -247,6 +341,33 @@ final class SpoofSession: ObservableObject {
         SavedPlace.save([], key: homeKey)
     }
 
+    func addShortcut(name: String, coordinate: CLLocationCoordinate2D) {
+        guard shortcuts.count < Self.maxShortcuts else {
+            lastError = "Maximal \(Self.maxShortcuts) Shortcuts möglich."
+            return
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        shortcuts.append(SavedPlace(
+            name: trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        ))
+        SavedPlace.save(shortcuts, key: shortcutsKey)
+    }
+
+    func removeShortcut(_ place: SavedPlace) {
+        shortcuts.removeAll { $0.id == place.id }
+        SavedPlace.save(shortcuts, key: shortcutsKey)
+    }
+
+    func renameShortcut(_ place: SavedPlace, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = shortcuts.firstIndex(where: { $0.id == place.id }) else { return }
+        shortcuts[index].name = trimmed
+        SavedPlace.save(shortcuts, key: shortcutsKey)
+    }
+
     /// Best-known real device coordinate (not the teleport pin).
     var realCoordinate: CLLocationCoordinate2D? {
         locationKeeper.lastKnownCoordinate
@@ -259,12 +380,12 @@ final class SpoofSession: ObservableObject {
 
     func startJoystick(pairing: PairingStore) {
         guard pairing.hasPairingFile else {
-            lastError = "Import an RPPairing file in Settings first."
+            lastError = "Richte zuerst die Kopplung in den Optionen ein."
             return
         }
         let start = simulated ?? pin ?? locationKeeper.lastKnownCoordinate
         guard let start else {
-            lastError = "Drop a pin or teleport somewhere before using the joystick."
+            lastError = "Wähle zuerst einen Ort auf der Karte."
             return
         }
         if simulated == nil {
@@ -272,7 +393,8 @@ final class SpoofSession: ObservableObject {
         }
         joystickActive = true
         joystickTimer?.invalidate()
-        joystickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        joystickStep = min(updateInterval, 1)
+        joystickTimer = Timer.scheduledTimer(withTimeInterval: joystickStep, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.tickJoystick(pairing: pairing)
             }
@@ -290,46 +412,166 @@ final class SpoofSession: ObservableObject {
         joystickTimer = nil
     }
 
-    func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
-        guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
+    func followRoute(_ plan: RoutePlan, pairing: PairingStore) {
+        guard pairing.hasPairingFile else {
+            lastError = "Richte zuerst die Kopplung in den Optionen ein."
+            return
+        }
+        guard plan.path.coordinates.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
+        routePaused = false
         routeTask = Task { [weak self] in
-            guard let self else { return }
-            var previous = coordinates[0]
-            await MainActor.run {
-                self.apply(previous, pairing: pairing, markRecent: true)
-            }
-            for next in coordinates.dropFirst() {
-                if Task.isCancelled { break }
-                let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
-                    .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                let exactSpeed = self.customSpeedEnabled
-                let speed = exactSpeed ? self.activeSpeed : max(0.8, self.activeSpeed * Double.random(in: 0.88...1.12))
-                let stepMeters: CLLocationDistance = exactSpeed ? max(1, speed * 0.5) : min(12, max(4, speed * 0.5))
-                let steps = max(1, Int(ceil(distance / stepMeters)))
-                for i in 1...steps {
-                    if Task.isCancelled { break }
-                    let t = Double(i) / Double(steps)
-                    let coord = CLLocationCoordinate2D(
-                        latitude: previous.latitude + (next.latitude - previous.latitude) * t,
-                        longitude: previous.longitude + (next.longitude - previous.longitude) * t
-                    )
-                    let delay = stepMeters / speed
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    // A cancelled sleep returns at once; applying here would re-enable
-                    // the simulation right after a restore.
-                    while self.status == .reconnecting && !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    }
-                    if Task.isCancelled { break }
-                    await MainActor.run {
-                        self.apply(coord, pairing: pairing, markRecent: false)
-                    }
+            await self?.runRoute(plan, pairing: pairing)
+        }
+    }
+
+    /// Leaves the simulation where the route currently is.
+    func cancelRoute() {
+        routeTask?.cancel()
+        routeTask = nil
+        routeProgress = nil
+        routePaused = false
+    }
+
+    /// Plans a car route to a shortcut, drives it at a fixed speed and stays there.
+    func drive(to place: SavedPlace, pairing: PairingStore) {
+        guard let origin = simulated ?? realCoordinate else {
+            lastError = "Dein Standort ist noch nicht bekannt. Warte einen Moment oder teleportiere dich."
+            return
+        }
+        isPlanningRoute = true
+        Task { [weak self] in
+            do {
+                guard let candidate = try await RouteBuilder.routes(through: [origin, place.coordinate], mode: .drive).first else {
+                    self?.isPlanningRoute = false
+                    self?.lastError = "Keine Route gefunden."
+                    return
                 }
-                previous = next
+                let signals = await RouteBuilder.signals(along: candidate.coordinates, mode: .drive)
+                guard let self else { return }
+                self.isPlanningRoute = false
+                self.followRoute(
+                    RouteBuilder.plan(candidate, signals: signals, speedOverride: Self.shortcutSpeedKmh / 3.6),
+                    pairing: pairing
+                )
+            } catch {
+                self?.isPlanningRoute = false
+                self?.lastError = error.localizedDescription
             }
         }
+    }
+
+    private struct PlannedStop {
+        var distance: CLLocationDistance
+        var waitSeconds: Int
+        var exitSpeed: CLLocationSpeed
+        var reason: String
+    }
+
+    /// Decides once per trip which lights are red and which junctions need a stop.
+    private func rollStops(for plan: RoutePlan) -> [PlannedStop] {
+        let turnSpeed: CLLocationSpeed = 4
+        return plan.waypoints.compactMap { waypoint in
+            switch waypoint.kind {
+            case .trafficLight:
+                guard Double.random(in: 0..<1) < stopFrequency.chance else { return nil }
+                return PlannedStop(
+                    distance: waypoint.distance,
+                    waitSeconds: Int.random(in: stopDuration.seconds),
+                    exitSpeed: 0,
+                    reason: "Hält an der Ampel"
+                )
+            case .turn:
+                let stops = Double.random(in: 0..<1) < stopFrequency.chance / 2
+                return PlannedStop(
+                    distance: waypoint.distance,
+                    waitSeconds: stops ? Int.random(in: 3...max(3, stopDuration.seconds.lowerBound)) : 0,
+                    exitSpeed: stops ? 0 : turnSpeed,
+                    reason: "Hält an der Kreuzung"
+                )
+            }
+        }
+    }
+
+    private func runRoute(_ plan: RoutePlan, pairing: PairingStore) async {
+        let path = plan.path
+        let stops = rollStops(for: plan)
+        let acceleration: CLLocationSpeed = 2
+        let braking: CLLocationSpeed = 2.5
+        var nextStop = 0
+        var travelled: CLLocationDistance = 0
+        var speed: CLLocationSpeed = 0
+        var pace = 1.0
+
+        pin = path.coordinate(at: 0)
+        apply(path.coordinate(at: 0), pairing: pairing, markRecent: true)
+
+        while travelled < path.length, !Task.isCancelled {
+            while (routePaused || status == .reconnecting), !Task.isCancelled {
+                publishRoute(plan, travelled: travelled, speed: 0, title: routePaused ? "Pausiert" : "Verbindung wird wiederhergestellt…")
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            let interval = updateInterval
+            let exact = customSpeedEnabled || plan.speedOverride != nil
+            if !exact {
+                pace = min(1.15, max(0.85, pace + Double.random(in: -0.04...0.04)))
+            }
+            let cruise = (plan.speedOverride ?? activeSpeed) * pace
+
+            var allowed = min(cruise, sqrt(2 * braking * max(path.length - travelled, 0)))
+            if nextStop < stops.count {
+                let stop = stops[nextStop]
+                let gap = max(stop.distance - travelled, 0)
+                allowed = min(allowed, sqrt(stop.exitSpeed * stop.exitSpeed + 2 * braking * gap))
+            }
+            speed = max(min(allowed, speed + acceleration * interval), 0.5)
+
+            var step = speed * interval
+            var reachedStop = false
+            if nextStop < stops.count, travelled + step >= stops[nextStop].distance {
+                step = max(stops[nextStop].distance - travelled, 0)
+                reachedStop = true
+            }
+
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            // A cancelled sleep returns at once; applying here would re-enable
+            // the simulation right after a restore.
+            if Task.isCancelled { return }
+
+            travelled = min(travelled + step, path.length)
+            apply(path.coordinate(at: travelled), pairing: pairing, markRecent: false)
+            publishRoute(plan, travelled: travelled, speed: speed, title: "Unterwegs")
+
+            guard reachedStop else { continue }
+            let stop = stops[nextStop]
+            nextStop += 1
+            if stop.waitSeconds > 0 {
+                speed = 0
+                for remaining in stride(from: stop.waitSeconds, to: 0, by: -1) {
+                    if Task.isCancelled { return }
+                    publishRoute(plan, travelled: travelled, speed: 0, title: "\(stop.reason) (\(remaining) s)")
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            } else {
+                speed = min(speed, stop.exitSpeed)
+            }
+        }
+
+        if !Task.isCancelled {
+            routeProgress = nil
+        }
+    }
+
+    private func publishRoute(_ plan: RoutePlan, travelled: CLLocationDistance, speed: CLLocationSpeed, title: String) {
+        let cruise = plan.speedOverride ?? activeSpeed
+        routeProgress = RouteProgress(
+            title: title,
+            travelled: travelled,
+            total: plan.path.length,
+            speedKmh: speed * 3.6,
+            cruiseSpeed: cruise
+        )
     }
 
     func addFavorite(name: String, coordinate: CLLocationCoordinate2D) {
@@ -488,7 +730,7 @@ final class SpoofSession: ObservableObject {
                 }
                 attempts += 1
                 if attempts == 5 {
-                    self.postDropNotification("Still reconnecting. Keep LocalDevVPN connected.")
+                    self.postDropNotification("Verbindet weiter neu. Lass LocalDevVPN verbunden.")
                 }
                 try? await Task.sleep(nanoseconds: delaySeconds * 1_000_000_000)
                 delaySeconds = min(delaySeconds * 2, 8)
@@ -504,15 +746,14 @@ final class SpoofSession: ObservableObject {
         let ny = -joystickVector.dy / magnitude
         let jitter = customSpeedEnabled ? 1.0 : Double.random(in: 0.9...1.1)
         let speed = activeSpeed * min(1.0, magnitude) * jitter
-        let dt = 0.25
-        let meters = speed * dt
+        let meters = speed * joystickStep
         let next = offset(coordinate: current, eastMeters: nx * meters, northMeters: ny * meters)
         apply(next, pairing: pairing, markRecent: false)
     }
 
     private func startResend(pairing: PairingStore) {
         resendTimer?.invalidate()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        resendTimer = Timer.scheduledTimer(withTimeInterval: max(1, updateInterval), repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.resendInFlight, self.reconnectTask == nil,
                       let sim = self.simulated else { return }
@@ -585,7 +826,7 @@ final class SpoofSession: ObservableObject {
     private func postDropNotification(_ message: String) {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         let content = UNMutableNotificationContent()
-        content.title = "Locus spoof dropped"
+        content.title = "Location Larper: Verbindung unterbrochen"
         content.body = message
         content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
