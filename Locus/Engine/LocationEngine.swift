@@ -67,10 +67,10 @@ enum LocationEngine {
         return result
     }
 
-    static func clear() -> Result<Void, LocationEngineError> {
+    static func clear(pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
         var result: Result<Void, LocationEngineError> = .failure(.notActive)
         queue.sync {
-            let code = clearLocked()
+            let code = clearLocked(pairingPath: pairingPath, deviceIP: deviceIP)
             result = code == ok ? .success(()) : .failure(.from(code: code))
         }
         return result
@@ -105,6 +105,18 @@ enum LocationEngine {
             }
         }
 
+        let connected = connectLocked(pairingPath: pairingPath, deviceIP: deviceIP)
+        guard connected == ok else { return connected }
+
+        if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
+            idevice_error_free(setError)
+            cleanup()
+            return locationSet
+        }
+        return ok
+    }
+
+    private static func connectLocked(pairingPath: String, deviceIP: String) -> Int32 {
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = in_port_t(49152).bigEndian
@@ -152,17 +164,25 @@ enum LocationEngine {
         }
         // location_simulation_new consumes/owns remote server lifecycle alongside handle
         remoteServer = nil
-
-        if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
-            idevice_error_free(setError)
-            cleanup()
-            return locationSet
-        }
         return ok
     }
 
-    private static func clearLocked() -> Int32 {
-        guard let locationSimulation else { return locationClear }
+    /// Clears the simulation, reconnecting first when the session dropped. A dead
+    /// session must not strand the device on the simulated location.
+    private static func clearLocked(pairingPath: String, deviceIP: String) -> Int32 {
+        if let locationSimulation {
+            let staleError = location_simulation_clear(locationSimulation)
+            cleanup()
+            if let staleError {
+                idevice_error_free(staleError)
+            } else {
+                return ok
+            }
+        }
+
+        let connected = connectLocked(pairingPath: pairingPath, deviceIP: deviceIP)
+        guard connected == ok else { return connected }
+
         let err = location_simulation_clear(locationSimulation)
         cleanup()
         if let err {

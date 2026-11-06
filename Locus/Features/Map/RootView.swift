@@ -191,6 +191,38 @@ struct BottomControlsView: View {
                     .buttonStyle(.plain)
                 }
                 Spacer(minLength: 0)
+
+                if session.customSpeedEnabled {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Text(String(format: "%.0f km/h", session.customSpeedKmh))
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                            .fixedSize()
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 10)
+                            .frame(height: 40)
+                            .background(Capsule().fill(LocusTheme.accentSecondary))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Custom speed")
+                }
+
+                Button {
+                    session.goHome(pairing: pairing)
+                } label: {
+                    Image(systemName: "house.fill")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 44, height: 40)
+                        .background(Capsule().fill(Color.primary.opacity(0.08)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .disabled(session.isBusy)
+                .accessibilityLabel("Go Home")
             }
 
             HStack(spacing: 10) {
@@ -220,7 +252,7 @@ struct BottomControlsView: View {
                 }
                 .buttonStyle(.plain)
 
-                if session.isSpoofing {
+                if session.canRestore {
                     Button {
                         session.stop(pairing: pairing)
                     } label: {

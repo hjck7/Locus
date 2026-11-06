@@ -78,9 +78,25 @@ final class SpoofSession: ObservableObject {
     @Published var lastError: String?
     @Published var isBusy = false
     @Published var joystickActive = false
+    /// Bumped when the map should recenter, e.g. on the real position after a restore.
+    @Published private(set) var recenterRevision = 0
 
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
+    @Published private(set) var home: SavedPlace?
+    @Published var customSpeedEnabled = false {
+        didSet { UserDefaults.standard.set(customSpeedEnabled, forKey: customSpeedEnabledKey) }
+    }
+    @Published var customSpeedKmh = SpoofSession.defaultCustomSpeedKmh {
+        didSet {
+            let clamped = min(max(customSpeedKmh, Self.customSpeedRange.lowerBound), Self.customSpeedRange.upperBound)
+            if clamped != customSpeedKmh {
+                customSpeedKmh = clamped
+            } else {
+                UserDefaults.standard.set(customSpeedKmh, forKey: customSpeedKey)
+            }
+        }
+    }
 
     private var resendTimer: Timer?
     private var healthTimer: Timer?
@@ -92,10 +108,21 @@ final class SpoofSession: ObservableObject {
 
     private let favoritesKey = "locus.favorites"
     private let recentsKey = "locus.recents"
+    private let homeKey = "locus.home"
+    private let customSpeedEnabledKey = "locus.customSpeedEnabled"
+    private let customSpeedKey = "locus.customSpeedKmh"
+
+    static let customSpeedRange: ClosedRange<Double> = 1...500
+    private static let defaultCustomSpeedKmh = 30.0
 
     init() {
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
+        home = SavedPlace.load(key: homeKey).first
+        customSpeedEnabled = UserDefaults.standard.bool(forKey: customSpeedEnabledKey)
+        if UserDefaults.standard.object(forKey: customSpeedKey) != nil {
+            customSpeedKmh = UserDefaults.standard.double(forKey: customSpeedKey)
+        }
     }
 
     var isSpoofing: Bool {
@@ -104,11 +131,24 @@ final class SpoofSession: ObservableObject {
         return false
     }
 
+    /// True while the device may still report a simulated location, including after a drop.
+    var canRestore: Bool {
+        isSpoofing || status.isDropped
+    }
+
+    /// Meters per second used by routes and the joystick.
+    private var activeSpeed: CLLocationSpeed {
+        customSpeedEnabled ? customSpeedKmh / 3.6 : travelMode.baseSpeed
+    }
+
     func teleport(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
         guard pairing.hasPairingFile else {
             lastError = "Import an RPPairing file in Settings first."
             return
         }
+        routeTask?.cancel()
+        routeTask = nil
+        stopJoystick()
         pin = coordinate
         apply(coordinate, pairing: pairing, markRecent: true)
     }
@@ -120,21 +160,49 @@ final class SpoofSession: ObservableObject {
         stopResend()
         stopHealth()
         isBusy = true
-        let result = LocationEngine.clear()
+        let result = LocationEngine.clear(pairingPath: pairing.pairingPath, deviceIP: TunnelConfig.targetIP)
         isBusy = false
         switch result {
         case .success:
             simulated = nil
+            pin = nil
             status = .idle
+            lastError = nil
             endBackground()
-            // Keep location updates running so the map puck / locate button
-            // can return to the real GPS fix (not the leftover pin).
-            locationKeeper.start()
+            // Force a fresh fix so the map puck / locate button return to the
+            // real GPS position (not the leftover pin or last spoofed fix).
+            locationKeeper.refreshAfterSimulation()
+            recenterRevision += 1
         case .failure(let error):
             lastError = error.localizedDescription
             status = .dropped(error.localizedDescription)
             postDropNotification(error.localizedDescription)
         }
+    }
+
+    func goHome(pairing: PairingStore) {
+        guard let home else {
+            lastError = "Set a Home address in Settings first."
+            return
+        }
+        teleport(to: home.coordinate, pairing: pairing)
+        recenterRevision += 1
+    }
+
+    func setHome(name: String, coordinate: CLLocationCoordinate2D) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let place = SavedPlace(
+            name: trimmed.isEmpty ? Self.coordinateLabel(coordinate) : trimmed,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+        home = place
+        SavedPlace.save([place], key: homeKey)
+    }
+
+    func removeHome() {
+        home = nil
+        SavedPlace.save([], key: homeKey)
     }
 
     /// Best-known real device coordinate (not the teleport pin).
@@ -184,7 +252,6 @@ final class SpoofSession: ObservableObject {
         guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
-        let mode = travelMode
         routeTask = Task { [weak self] in
             guard let self else { return }
             var previous = coordinates[0]
@@ -195,9 +262,9 @@ final class SpoofSession: ObservableObject {
                 if Task.isCancelled { break }
                 let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
                     .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                var speed = mode.baseSpeed * Double.random(in: 0.88...1.12)
-                speed = max(0.8, speed)
-                let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
+                let exactSpeed = self.customSpeedEnabled
+                let speed = exactSpeed ? self.activeSpeed : max(0.8, self.activeSpeed * Double.random(in: 0.88...1.12))
+                let stepMeters: CLLocationDistance = exactSpeed ? max(1, speed * 0.5) : min(12, max(4, speed * 0.5))
                 let steps = max(1, Int(ceil(distance / stepMeters)))
                 for i in 1...steps {
                     if Task.isCancelled { break }
@@ -208,6 +275,9 @@ final class SpoofSession: ObservableObject {
                     )
                     let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    // A cancelled sleep returns at once; applying here would re-enable
+                    // the simulation right after a restore.
+                    if Task.isCancelled { break }
                     await MainActor.run {
                         self.apply(coord, pairing: pairing, markRecent: false)
                     }
@@ -329,7 +399,8 @@ final class SpoofSession: ObservableObject {
         guard magnitude > 0.08 else { return }
         let nx = joystickVector.dx / magnitude
         let ny = -joystickVector.dy / magnitude
-        let speed = travelMode.baseSpeed * min(1.0, magnitude) * Double.random(in: 0.9...1.1)
+        let jitter = customSpeedEnabled ? 1.0 : Double.random(in: 0.9...1.1)
+        let speed = activeSpeed * min(1.0, magnitude) * jitter
         let dt = 0.25
         let meters = speed * dt
         let next = offset(coordinate: current, eastMeters: nx * meters, northMeters: ny * meters)

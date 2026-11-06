@@ -1,3 +1,4 @@
+import MapKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -11,6 +12,9 @@ struct SettingsView: View {
     @State private var showNameEasterEgg = false
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
+    @StateObject private var homeSearch = PlaceSearchCompleter()
+    @State private var homeQuery = ""
+    @State private var speedText = ""
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -96,6 +100,74 @@ struct SettingsView: View {
                     Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward.")
                 }
 
+                Section {
+                    if let home = session.home {
+                        LabeledContent("Home", value: home.name)
+                    }
+                    TextField("Search address", text: $homeQuery)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                        .onChange(of: homeQuery) { _, value in
+                            homeSearch.query = value
+                        }
+                    if !homeQuery.isEmpty {
+                        ForEach(homeSearch.results.prefix(5), id: \.self) { item in
+                            Button {
+                                selectHome(item)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.title).foregroundStyle(.primary)
+                                    if !item.subtitle.isEmpty {
+                                        Text(item.subtitle)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let pin = session.pin {
+                        Button("Use current pin as Home") {
+                            session.setHome(name: session.suggestedFavoriteName(for: pin), coordinate: pin)
+                        }
+                    }
+                    if session.home != nil {
+                        Button("Remove Home", role: .destructive) {
+                            session.removeHome()
+                        }
+                    }
+                } header: {
+                    Text("Home")
+                } footer: {
+                    Text("The house button on the map teleports you here. Use Stop to restore your real location.")
+                }
+
+                Section {
+                    Toggle("Custom speed", isOn: $session.customSpeedEnabled)
+                    if session.customSpeedEnabled {
+                        Slider(value: $session.customSpeedKmh, in: SpoofSession.customSpeedRange, step: 1)
+                        LabeledContent("Speed") {
+                            HStack(spacing: 4) {
+                                TextField("30", text: $speedText)
+                                    .keyboardType(.decimalPad)
+                                    .multilineTextAlignment(.trailing)
+                                    .frame(width: 72)
+                                    .onChange(of: speedText) { _, value in
+                                        if let speed = parsedSpeed(value),
+                                           SpoofSession.customSpeedRange.contains(speed) {
+                                            session.customSpeedKmh = speed
+                                        }
+                                    }
+                                Text("km/h").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Speed")
+                } footer: {
+                    Text("Overrides the travel modes for routes and the joystick. 1–500 km/h, without random variation.")
+                }
+
                 Section("Privacy") {
                     Text("Fully on-device. Favorites and recents stay in UserDefaults. No analytics, no accounts, nothing uploaded.")
                         .font(.footnote)
@@ -158,11 +230,44 @@ struct SettingsView: View {
             }
             .onAppear {
                 localDevVPNInstalled = LocalDevVPN.isInstalled
+                speedText = formattedSpeed(session.customSpeedKmh)
+            }
+            .onChange(of: session.customSpeedKmh) { _, value in
+                if parsedSpeed(speedText) != value {
+                    speedText = formattedSpeed(value)
+                }
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     localDevVPNInstalled = LocalDevVPN.isInstalled
                 }
+            }
+        }
+    }
+
+    private func parsedSpeed(_ text: String) -> Double? {
+        Double(text.replacingOccurrences(of: ",", with: "."))
+    }
+
+    private func formattedSpeed(_ speed: Double) -> String {
+        speed.rounded() == speed ? String(format: "%.0f", speed) : String(format: "%.1f", speed)
+    }
+
+    private func selectHome(_ completion: MKLocalSearchCompletion) {
+        Task {
+            let request = MKLocalSearch.Request(completion: completion)
+            guard let response = try? await MKLocalSearch(request: request).start(),
+                  let item = response.mapItems.first else {
+                await MainActor.run {
+                    session.lastError = "Could not find that address."
+                }
+                return
+            }
+            let coord = item.placemark.coordinate
+            let name = completion.subtitle.isEmpty ? completion.title : "\(completion.title), \(completion.subtitle)"
+            await MainActor.run {
+                session.setHome(name: name, coordinate: coord)
+                homeQuery = ""
             }
         }
     }
