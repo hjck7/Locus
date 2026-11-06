@@ -130,6 +130,35 @@ struct RoutePlan {
     var displayCoordinates: [CLLocationCoordinate2D]
 }
 
+/// One drive of a Rundfahrt, ending at `destination`.
+struct CruiseLeg {
+    var plan: RoutePlan
+    var destination: CruiseStop
+    var isDetour: Bool
+}
+
+/// A full round from the first stop back to it.
+struct CruiseLap {
+    var start: CruiseStop
+    var legs: [CruiseLeg]
+    var distance: CLLocationDistance
+    var seconds: TimeInterval
+    var detours: Int
+}
+
+/// What a Rundfahrt export file contains. Routes are planned again after importing.
+struct CruiseFile: Codable {
+    struct Stop: Codable {
+        var name: String
+        var latitude: Double
+        var longitude: Double
+        var stayMinutes: Double
+    }
+
+    var minimumMinutes: Int
+    var stops: [Stop]
+}
+
 enum RouteBuilder {
     // Public servers are often overloaded, so all are asked and the first answer wins.
     private static let signalEndpoints = [
@@ -222,22 +251,7 @@ enum RouteBuilder {
             .joined(separator: ",")
         let types = mode == .walk || mode == .run ? "traffic_signals|crossing" : "traffic_signals|stop"
         let query = "[out:json][timeout:15];node[\"highway\"~\"^(\(types))$\"](around:18,\(line));out skel;"
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~")
-        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
-
-        let found = await withTaskGroup(of: [CLLocationCoordinate2D]?.self) { group -> [CLLocationCoordinate2D]? in
-            for endpoint in signalEndpoints {
-                group.addTask { await fetchSignals(from: endpoint, body: "data=\(encoded)") }
-            }
-            for await result in group {
-                if let result {
-                    group.cancelAll()
-                    return result
-                }
-            }
-            return nil
-        }
+        let found = await fetchSignals(query: query)
         return found?.filter { path.nearest(to: $0).offset <= 25 }
     }
 
@@ -254,6 +268,121 @@ enum RouteBuilder {
         return decoded.elements.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
     }
 
+    private static let maxLapLegs = 40
+
+    /// Plans legs until the lap lasts at least `minimumMinutes`, then returns to the
+    /// first stop. Base routes repeat on purpose; detours and alternatives add variety.
+    static func buildLap(
+        stops: [CruiseStop],
+        mode: TravelMode,
+        speed: CLLocationSpeed,
+        minimumMinutes: Int
+    ) async throws -> CruiseLap {
+        guard stops.count >= 2 else { throw noRouteError }
+        var known: [String: [RouteCandidate]] = [:]
+        var picks: [(candidate: RouteCandidate, stop: CruiseStop, detour: Bool)] = []
+        var seconds = stops[0].stayMinutes * 60
+        var distance: CLLocationDistance = 0
+        var detours = 0
+        var current = 0
+        var previous = 0
+
+        while picks.count < maxLapLegs {
+            let done = seconds >= Double(minimumMinutes) * 60
+            if done && current == 0 { break }
+            let next = done ? 0 : nextCruiseStop(current: current, previous: previous, count: stops.count)
+            let from = stops[current].coordinate
+            let to = stops[next].coordinate
+            let key = "\(current)-\(next)"
+            if known[key] == nil {
+                known[key] = try await routes(through: [from, to], mode: mode)
+            }
+            guard let options = known[key], let base = options.first else { throw noRouteError }
+
+            var chosen = base
+            var detour = false
+            let roll = Double.random(in: 0..<1)
+            if roll < 0.35, let side = try? await routes(through: [from, detourPoint(from: from, to: to), to], mode: mode).first {
+                chosen = side
+                detour = true
+                detours += 1
+            } else if roll < 0.6, options.count > 1 {
+                chosen = options[Int.random(in: 1..<options.count)]
+            }
+            picks.append((chosen, stops[next], detour))
+            distance += chosen.length
+            seconds += chosen.length / max(speed, 0.1) + stops[next].stayMinutes * 60
+            previous = current
+            current = next
+        }
+
+        // One request for the whole area keeps a long lap from hammering the servers.
+        let lights = await signals(inBoundsOf: picks.flatMap(\.candidate.displayCoordinates), mode: mode) ?? []
+        let legs = picks.map { pick in
+            CruiseLeg(
+                plan: plan(pick.candidate, signals: lights, destinationName: pick.stop.name),
+                destination: pick.stop,
+                isDetour: pick.detour
+            )
+        }
+        return CruiseLap(start: stops[0], legs: legs, distance: distance, seconds: seconds, detours: detours)
+    }
+
+    private static func nextCruiseStop(current: Int, previous: Int, count: Int) -> Int {
+        let roll = Double.random(in: 0..<1)
+        if roll < 0.6 { return (current + 1) % count }
+        if roll < 0.8, previous != current { return previous }
+        let others = (0..<count).filter { $0 != current }
+        return others.randomElement() ?? (current + 1) % count
+    }
+
+    /// A point beside the direct line, so the route turns off and comes back.
+    private static func detourPoint(from: CLLocationCoordinate2D, to: CLLocationCoordinate2D) -> CLLocationCoordinate2D {
+        let metersPerDegree = 111_320.0
+        let lonScale = cos(from.latitude * .pi / 180)
+        let east = (to.longitude - from.longitude) * lonScale * metersPerDegree
+        let north = (to.latitude - from.latitude) * metersPerDegree
+        let length = max(hypot(east, north), 1)
+        let side = Bool.random() ? 1.0 : -1.0
+        let offset = min(max(length * 0.3, 200), 900) * side
+        let along = Double.random(in: 0.3...0.7)
+        return CLLocationCoordinate2D(
+            latitude: from.latitude + (to.latitude - from.latitude) * along + (east / length * offset) / metersPerDegree,
+            longitude: from.longitude + (to.longitude - from.longitude) * along - (north / length * offset) / (metersPerDegree * lonScale)
+        )
+    }
+
+    private static func signals(
+        inBoundsOf coordinates: [CLLocationCoordinate2D],
+        mode: TravelMode
+    ) async -> [CLLocationCoordinate2D]? {
+        guard let south = coordinates.map(\.latitude).min(),
+              let north = coordinates.map(\.latitude).max(),
+              let west = coordinates.map(\.longitude).min(),
+              let east = coordinates.map(\.longitude).max() else { return [] }
+        let box = String(format: "%.4f,%.4f,%.4f,%.4f", south, west, north, east)
+        let types = mode == .walk || mode == .run ? "traffic_signals|crossing" : "traffic_signals|stop"
+        return await fetchSignals(query: "[out:json][timeout:15];node[\"highway\"~\"^(\(types))$\"](\(box));out skel;")
+    }
+
+    private static func fetchSignals(query: String) async -> [CLLocationCoordinate2D]? {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+        return await withTaskGroup(of: [CLLocationCoordinate2D]?.self) { group -> [CLLocationCoordinate2D]? in
+            for endpoint in signalEndpoints {
+                group.addTask { await fetchSignals(from: endpoint, body: "data=\(encoded)") }
+            }
+            for await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            return nil
+        }
+    }
+
     static func plan(
         _ candidate: RouteCandidate,
         signals: [CLLocationCoordinate2D],
@@ -261,7 +390,11 @@ enum RouteBuilder {
         destinationName: String? = nil
     ) -> RoutePlan {
         let path = RoutePath(candidate.coordinates)
-        let lights = signals.map { RouteWaypoint(distance: path.nearest(to: $0).along, kind: .trafficLight) }
+        let onRoute = signals.compactMap { signal -> (coordinate: CLLocationCoordinate2D, along: CLLocationDistance)? in
+            let match = path.nearest(to: signal)
+            return match.offset <= 25 ? (signal, match.along) : nil
+        }
+        let lights = onRoute.map { RouteWaypoint(distance: $0.along, kind: .trafficLight) }
         let turns = candidate.turns.map { RouteWaypoint(distance: path.nearest(to: $0).along, kind: .turn) }
         // Lights win over a turn at the same junction.
         var waypoints: [RouteWaypoint] = []
@@ -280,7 +413,7 @@ enum RouteBuilder {
             waypoints: waypoints,
             speedOverride: speedOverride,
             destinationName: destinationName,
-            signals: signals,
+            signals: onRoute.map(\.coordinate),
             displayCoordinates: candidate.displayCoordinates
         )
     }

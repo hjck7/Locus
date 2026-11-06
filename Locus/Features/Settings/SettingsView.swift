@@ -182,6 +182,11 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Ankunft in der Dynamic Island", isOn: $session.liveActivityEnabled)
+                    LabeledContent("Status") {
+                        Text(RouteLiveActivity.problem ?? "Bereit")
+                            .foregroundStyle(RouteLiveActivity.problem == nil ? LocusTheme.statusGood : LocusTheme.statusWarn)
+                            .multilineTextAlignment(.trailing)
+                    }
                 } footer: {
                     Text("Zeigt während einer Fahrt Arriving in … at … an.")
                 }

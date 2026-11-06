@@ -10,6 +10,7 @@ struct MapHomeView: View {
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
     @StateObject private var planner = RoutePlannerModel()
+    @State private var lastFollow = Date.distantPast
     @State private var showGPXImporter = false
     @State private var drawnPath: [CLLocationCoordinate2D] = []
     @State private var drawMode = false
@@ -78,17 +79,27 @@ struct MapHomeView: View {
                     if let sim = session.simulated {
                         Annotation("Spoof", coordinate: sim) {
                             ZStack {
-                                Circle().fill(LocusTheme.accent.opacity(0.25)).frame(width: 44, height: 44)
-                                Circle().fill(LocusTheme.accent).frame(width: 14, height: 14)
-                                    .overlay(Circle().stroke(.white, lineWidth: 2))
+                                Circle().fill(LocusTheme.accent.opacity(0.3)).frame(width: 56, height: 56)
+                                Circle().fill(LocusTheme.accent).frame(width: 20, height: 20)
+                                    .overlay(Circle().stroke(.white, lineWidth: 3))
                             }
                         }
                     }
-                    ForEach(planner.candidates.filter { $0.id != planner.selected?.id }) { candidate in
+                    if session.routeProgress == nil, let lap = planner.cruiseLap, planner.mode == .cruise {
+                        ForEach(Array(lap.legs.enumerated()), id: \.offset) { _, leg in
+                            MapPolyline(coordinates: leg.plan.displayCoordinates)
+                                .stroke(LocusTheme.accentSecondary.opacity(0.7), lineWidth: 4)
+                        }
+                    }
+                    ForEach(Array(session.cruiseLapRoutes.enumerated()), id: \.offset) { _, route in
+                        MapPolyline(coordinates: route)
+                            .stroke(LocusTheme.accentSecondary.opacity(0.45), lineWidth: 4)
+                    }
+                    ForEach(planner.mode == .route ? planner.candidates.filter { $0.id != planner.selected?.id } : []) { candidate in
                         MapPolyline(coordinates: candidate.displayCoordinates)
                             .stroke(.gray.opacity(0.6), lineWidth: 4)
                     }
-                    if let route = planner.selected {
+                    if planner.mode == .route, let route = planner.selected {
                         MapPolyline(coordinates: route.displayCoordinates)
                             .stroke(LocusTheme.accent, lineWidth: 6)
                     }
@@ -96,7 +107,7 @@ struct MapHomeView: View {
                         MapPolyline(coordinates: session.activeRoute)
                             .stroke(LocusTheme.accentSecondary, lineWidth: 6)
                     }
-                    if planner.mode == .cruise, planner.cruiseStops.count > 1, session.routeProgress == nil {
+                    if planner.mode == .cruise, planner.cruiseLap == nil, planner.cruiseStops.count > 1, session.routeProgress == nil {
                         MapPolyline(coordinates: planner.cruiseStops.map(\.coordinate))
                             .stroke(LocusTheme.accentSecondary, style: StrokeStyle(lineWidth: 3, dash: [6, 6]))
                     }
@@ -167,6 +178,9 @@ struct MapHomeView: View {
         .onChange(of: session.recenterRevision) { _, _ in
             goToCurrentLocation()
         }
+        .onChange(of: session.simulated?.latitude) { _, _ in
+            followTrip()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .locusImportGPX)) { note in
             guard let url = note.object as? URL else { return }
             importGPX(url)
@@ -191,8 +205,18 @@ struct MapHomeView: View {
                     drawMode = true
                     session.showRoutePlanner = false
                 },
-                onImportGPX: { showGPXImporter = true },
-                onExportGPX: exportGPX
+                onImportGPX: {
+                    session.showRoutePlanner = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        showGPXImporter = true
+                    }
+                },
+                onExportGPX: exportGPX,
+                onExportCruise: {
+                    if let url = session.shareFile {
+                        share(url)
+                    }
+                }
             )
             .presentationDetents([.medium, .large])
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
@@ -206,6 +230,28 @@ struct MapHomeView: View {
             .frame(width: 26, height: 26)
             .background(Circle().fill(color))
             .overlay(Circle().stroke(.white, lineWidth: 2))
+    }
+
+    /// Keeps the moving position in view until the user pans the map.
+    private func followTrip() {
+        guard session.routeProgress != nil, !position.positionedByUser,
+              let simulated = session.simulated,
+              Date().timeIntervalSince(lastFollow) >= 4 else { return }
+        lastFollow = Date()
+        withAnimation(.linear(duration: 1)) {
+            position = .region(MKCoordinateRegion(center: simulated, latitudinalMeters: 900, longitudinalMeters: 900))
+        }
+    }
+
+    /// Finds the top controller, since sharing starts from inside the planner sheet.
+    private func share(_ url: URL) {
+        let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              var top = scene.keyWindow?.rootViewController else { return }
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        top.present(av, animated: true)
     }
 
     private func releasePin() {
@@ -510,11 +556,7 @@ struct MapHomeView: View {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("LocationLarper-Route.gpx")
         do {
             try gpx.data(using: .utf8)?.write(to: url)
-            let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-            if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-               let root = scene.keyWindow?.rootViewController {
-                root.present(av, animated: true)
-            }
+            share(url)
         } catch {
             session.lastError = error.localizedDescription
         }

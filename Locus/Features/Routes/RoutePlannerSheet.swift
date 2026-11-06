@@ -1,6 +1,7 @@
 import CoreLocation
 import MapKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RouteStopDraft: Identifiable {
     let id = UUID()
@@ -62,7 +63,14 @@ final class RoutePlannerModel: ObservableObject {
     @Published var start: RouteStopDraft?
     @Published var vias: [RouteStopDraft] = []
     @Published var destination: RouteStopDraft?
-    @Published var cruiseStops: [CruiseStop] = []
+    @Published var cruiseStops: [CruiseStop] = [] {
+        didSet { cruiseLap = nil }
+    }
+    @Published var cruiseMinutes = 45 {
+        didSet { cruiseLap = nil }
+    }
+    @Published private(set) var cruiseLap: CruiseLap?
+    @Published private(set) var isBuildingLap = false
     @Published private(set) var candidates: [RouteCandidate] = []
     @Published private(set) var selectedID: UUID?
     @Published private(set) var signals: [CLLocationCoordinate2D] = []
@@ -246,10 +254,60 @@ final class RoutePlannerModel: ObservableObject {
         }
     }
 
+    func buildLap(session: SpoofSession) {
+        let stops = cruiseStops
+        let mode = session.travelMode
+        let speed = session.routeSpeed
+        let minutes = cruiseMinutes
+        isBuildingLap = true
+        Task { [weak self] in
+            do {
+                let lap = try await RouteBuilder.buildLap(stops: stops, mode: mode, speed: speed, minimumMinutes: minutes)
+                self?.cruiseLap = lap
+            } catch {
+                session.lastError = error.localizedDescription
+            }
+            self?.isBuildingLap = false
+        }
+    }
+
+    func exportCruise() -> URL? {
+        let file = CruiseFile(
+            minimumMinutes: cruiseMinutes,
+            stops: cruiseStops.map {
+                .init(name: $0.name, latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude, stayMinutes: $0.stayMinutes)
+            }
+        )
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Rundfahrt.json")
+        guard let data = try? JSONEncoder().encode(file), (try? data.write(to: url)) != nil else { return nil }
+        return url
+    }
+
+    func importCruise(from url: URL, session: SpoofSession) {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url),
+              let file = try? JSONDecoder().decode(CruiseFile.self, from: data),
+              !file.stops.isEmpty else {
+            session.lastError = "Diese Datei ist keine gültige Rundfahrt."
+            return
+        }
+        cruiseMinutes = max(file.minimumMinutes, 45)
+        cruiseStops = file.stops.prefix(Self.maxCruiseStops).map {
+            CruiseStop(
+                name: $0.name,
+                coordinate: CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude),
+                stayMinutes: $0.stayMinutes
+            )
+        }
+    }
+
     func startDriving(session: SpoofSession, pairing: PairingStore) {
         guard let candidate = selected else { return }
         let lights = signals
         let name = destination?.name
+        // The trip draws its own route; a leftover plan would stay on the map.
+        clear()
         Task {
             let plan = await Task.detached(priority: .userInitiated) {
                 RouteBuilder.plan(candidate, signals: lights, destinationName: name)
@@ -334,11 +392,13 @@ struct RoutePlannerSheet: View {
     var onDraw: () -> Void
     var onImportGPX: () -> Void
     var onExportGPX: () -> Void
+    var onExportCruise: () -> Void
 
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
     @Environment(\.dismiss) private var dismiss
     @State private var searchSlot: RouteSlot = .destination
+    @State private var showCruiseImporter = false
 
     var body: some View {
         NavigationStack {
@@ -365,6 +425,9 @@ struct RoutePlannerSheet: View {
                 if planner.mode == .route, planner.isRouting || !planner.candidates.isEmpty {
                     routesSection
                 }
+                if planner.mode == .cruise {
+                    lapSection
+                }
                 Section("Fahrverhalten") {
                     DrivingBehaviorFields()
                 }
@@ -384,6 +447,11 @@ struct RoutePlannerSheet: View {
             }
             .onChange(of: session.travelMode) { _, _ in
                 planner.rebuild(session: session)
+            }
+            .fileImporter(isPresented: $showCruiseImporter, allowedContentTypes: [.json]) { result in
+                if case .success(let url) = result {
+                    planner.importCruise(from: url, session: session)
+                }
             }
         }
     }
@@ -430,6 +498,46 @@ struct RoutePlannerSheet: View {
             Text("Punkte (\(planner.cruiseStops.count)/\(RoutePlannerModel.maxCruiseStops))")
         } footer: {
             Text("Start und bis zu 5 Punkte. Du fährst endlos zwischen ihnen hin und her, oft über dieselben Straßen, in leicht wechselnder Reihenfolge. Wischen löscht einen Punkt.")
+        }
+    }
+
+    private var lapSection: some View {
+        Section {
+            Stepper(value: $planner.cruiseMinutes, in: 45...480, step: 15) {
+                Text("Mindestens \(planner.cruiseMinutes) min pro Runde")
+            }
+            if planner.isBuildingLap {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Runde wird berechnet…").foregroundStyle(.secondary)
+                }
+            } else if let lap = planner.cruiseLap {
+                LabeledContent("Eine Runde", value: RouteFormat.duration(lap.seconds))
+                LabeledContent("Strecke", value: RouteFormat.distance(lap.distance))
+                LabeledContent("Abbiegungen vom Weg", value: "\(lap.detours)")
+                LabeledContent("Fahrten pro Runde", value: "\(lap.legs.count)")
+                Button("Neue Variante berechnen") {
+                    planner.buildLap(session: session)
+                }
+            }
+            Button {
+                if let url = planner.exportCruise() {
+                    session.shareFile = url
+                    onExportCruise()
+                }
+            } label: {
+                Label("Rundfahrt exportieren", systemImage: "square.and.arrow.up")
+            }
+            .disabled(planner.cruiseStops.isEmpty)
+            Button {
+                showCruiseImporter = true
+            } label: {
+                Label("Rundfahrt importieren", systemImage: "square.and.arrow.down")
+            }
+        } header: {
+            Text("Runde")
+        } footer: {
+            Text("Die Zeit enthält Fahrten, Abbiegungen und Aufenthalte, aber keine Wartezeit an Ampeln. Die Runde wird nach dem Ende wiederholt.")
         }
     }
 
@@ -581,19 +689,28 @@ struct RoutePlannerSheet: View {
     }
 
     private var canStart: Bool {
-        planner.mode == .route ? planner.selected != nil : planner.cruiseStops.count >= 2
+        planner.mode == .route ? planner.selected != nil : planner.cruiseStops.count >= 2 && !planner.isBuildingLap
+    }
+
+    private var startTitle: String {
+        if planner.mode == .route { return "Route starten" }
+        return planner.cruiseLap == nil ? "Runde berechnen" : "Rundfahrt starten"
     }
 
     private var startButton: some View {
         Button {
             if planner.mode == .route {
                 planner.startDriving(session: session, pairing: pairing)
+            } else if let lap = planner.cruiseLap {
+                planner.clear()
+                session.startCruise(lap, pairing: pairing)
             } else {
-                session.startCruise(planner.cruiseStops, pairing: pairing)
+                planner.buildLap(session: session)
+                return
             }
             dismiss()
         } label: {
-            Label(planner.mode == .route ? "Route starten" : "Rundfahrt starten", systemImage: "play.fill")
+            Label(startTitle, systemImage: planner.mode == .cruise && planner.cruiseLap == nil ? "map.fill" : "play.fill")
                 .font(.headline)
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)

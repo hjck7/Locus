@@ -34,8 +34,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.chrismack.locus
         PRODUCT_NAME: Locus
-        MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "7"
+        MARKETING_VERSION: "1.5.0"
+        CURRENT_PROJECT_VERSION: "8"
         INFOPLIST_FILE: Locus/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Locus/Resources/Locus.entitlements
         CODE_SIGN_STYLE: Automatic
@@ -73,8 +73,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.chrismack.locus.routeactivity
         PRODUCT_NAME: LocationLarperWidget
-        MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "7"
+        MARKETING_VERSION: "1.5.0"
+        CURRENT_PROJECT_VERSION: "8"
         INFOPLIST_FILE: LocationLarperWidget/Info.plist
         GENERATE_INFOPLIST_FILE: false
         CODE_SIGN_STYLE: Automatic
