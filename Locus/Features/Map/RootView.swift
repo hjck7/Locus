@@ -198,20 +198,16 @@ struct BottomControlsView: View {
                     Button {
                         session.travelMode = mode
                     } label: {
-                        VStack(spacing: 2) {
-                            Image(systemName: mode.icon).font(.footnote.weight(.semibold))
-                            Text(mode.title).font(.caption2.weight(.semibold)).lineLimit(1)
-                        }
-                        .foregroundStyle(selected ? .black : .primary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(selected ? LocusTheme.accent : Color.primary.opacity(0.08))
-                        )
-                        .contentShape(Rectangle())
+                        Image(systemName: mode.icon)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(selected ? .white : .secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(selected ? LocusTheme.accent : Color.clear))
+                            .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(mode.title)
                 }
             }
 
@@ -221,7 +217,7 @@ struct BottomControlsView: View {
 
             HStack(spacing: 8) {
                 if showsTeleport {
-                    primaryButton(session.canRestore ? "Hierhin" : "Hierhin teleportieren", color: LocusTheme.accent, foreground: .black) {
+                    primaryButton(session.canRestore ? "Hierhin" : "Hierhin teleportieren", color: LocusTheme.accent, foreground: .white) {
                         if let pin = session.pin {
                             session.teleport(to: pin, pairing: pairing)
                         }

@@ -52,6 +52,14 @@ enum StopDuration: Int, CaseIterable, Identifiable {
     }
 }
 
+/// A planned stop shown on the map during a trip.
+struct RouteStopMarker: Identifiable {
+    let id: Int
+    let coordinate: CLLocationCoordinate2D
+    let seconds: Int
+    let isTrafficLight: Bool
+}
+
 struct RouteProgress: Equatable {
     var title: String
     var travelled: CLLocationDistance
@@ -142,6 +150,8 @@ final class SpoofSession: ObservableObject {
     @Published private(set) var recenterRevision = 0
     @Published var showRoutePlanner = false
     @Published private(set) var routeProgress: RouteProgress?
+    @Published private(set) var activeRoute: [CLLocationCoordinate2D] = []
+    @Published private(set) var stopMarkers: [RouteStopMarker] = []
     @Published private(set) var isPlanningRoute = false
     @Published var routePaused = false
     @Published private(set) var shortcuts: [SavedPlace] = []
@@ -432,6 +442,8 @@ final class SpoofSession: ObservableObject {
         routeTask = nil
         routeProgress = nil
         routePaused = false
+        activeRoute = []
+        stopMarkers = []
     }
 
     /// Plans a car route to a shortcut, drives it at a fixed speed and stays there.
@@ -467,12 +479,16 @@ final class SpoofSession: ObservableObject {
         var waitSeconds: Int
         var exitSpeed: CLLocationSpeed
         var reason: String
+        var isTrafficLight: Bool
     }
 
     /// Decides once per trip which lights are red and which junctions need a stop.
     private func rollStops(for plan: RoutePlan) -> [PlannedStop] {
         let turnSpeed: CLLocationSpeed = 4
-        return plan.waypoints.compactMap { waypoint in
+        // With real lights known, plain junctions only slow down; waiting there
+        // would stop in places where traffic keeps moving.
+        let hasLights = plan.waypoints.contains { $0.kind == .trafficLight }
+        return plan.waypoints.compactMap { waypoint -> PlannedStop? in
             switch waypoint.kind {
             case .trafficLight:
                 guard Double.random(in: 0..<1) < stopFrequency.chance else { return nil }
@@ -480,15 +496,17 @@ final class SpoofSession: ObservableObject {
                     distance: waypoint.distance,
                     waitSeconds: Int.random(in: stopDuration.seconds),
                     exitSpeed: 0,
-                    reason: "Hält an der Ampel"
+                    reason: "Hält an der Ampel",
+                    isTrafficLight: true
                 )
             case .turn:
-                let stops = Double.random(in: 0..<1) < stopFrequency.chance / 2
+                let stops = !hasLights && Double.random(in: 0..<1) < stopFrequency.chance / 2
                 return PlannedStop(
                     distance: waypoint.distance,
                     waitSeconds: stops ? Int.random(in: 3...max(3, stopDuration.seconds.lowerBound)) : 0,
                     exitSpeed: stops ? 0 : turnSpeed,
-                    reason: "Hält an der Kreuzung"
+                    reason: "Hält an der Kreuzung",
+                    isTrafficLight: false
                 )
             }
         }
@@ -497,6 +515,16 @@ final class SpoofSession: ObservableObject {
     private func runRoute(_ plan: RoutePlan, pairing: PairingStore) async {
         let path = plan.path
         let stops = rollStops(for: plan)
+        activeRoute = path.coordinates
+        stopMarkers = stops.enumerated().compactMap { index, stop in
+            guard stop.waitSeconds > 0 else { return nil }
+            return RouteStopMarker(
+                id: index,
+                coordinate: path.coordinate(at: stop.distance),
+                seconds: stop.waitSeconds,
+                isTrafficLight: stop.isTrafficLight
+            )
+        }
         let acceleration: CLLocationSpeed = 2
         let braking: CLLocationSpeed = 2.5
         var nextStop = 0
@@ -545,6 +573,7 @@ final class SpoofSession: ObservableObject {
 
             guard reachedStop else { continue }
             let stop = stops[nextStop]
+            let stopIndex = nextStop
             nextStop += 1
             if stop.waitSeconds > 0 {
                 speed = 0
@@ -553,6 +582,7 @@ final class SpoofSession: ObservableObject {
                     publishRoute(plan, travelled: travelled, speed: 0, title: "\(stop.reason) (\(remaining) s)")
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
+                stopMarkers.removeAll { $0.id == stopIndex }
             } else {
                 speed = min(speed, stop.exitSpeed)
             }
@@ -560,6 +590,8 @@ final class SpoofSession: ObservableObject {
 
         if !Task.isCancelled {
             routeProgress = nil
+            activeRoute = []
+            stopMarkers = []
         }
     }
 

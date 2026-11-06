@@ -285,7 +285,7 @@ struct SetupFlowView: View {
         HStack(alignment: .top, spacing: 12) {
             Text("\(n)")
                 .font(.caption.weight(.bold))
-                .foregroundStyle(.black)
+                .foregroundStyle(.white)
                 .frame(width: 22, height: 22)
                 .background(LocusTheme.accent, in: Circle())
             Text(text)
@@ -389,7 +389,7 @@ struct SetupFlowView: View {
         Button(action: action) {
             Text(title)
                 .font(.headline)
-                .foregroundStyle(.black)
+                .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
                 .background(Capsule().fill(LocusTheme.accent))

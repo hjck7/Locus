@@ -7,6 +7,9 @@ struct MapDropPin: View {
     var isDragging: Bool
     var onSelect: () -> Void
     var onRemove: () -> Void
+    var onSetStart: () -> Void
+    var onSetEnd: () -> Void
+    var onSetVia: () -> Void
     var onDragBegan: () -> Void
     var onDragMoved: (CGPoint) -> Void
     var onDragEnded: () -> Void
@@ -14,14 +17,14 @@ struct MapDropPin: View {
     var body: some View {
         VStack(spacing: 8) {
             if selected && !isDragging {
-                Button(action: onRemove) {
-                    Label("Remove Pin", systemImage: "trash.fill")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(LocusTheme.danger)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
+                HStack(spacing: 2) {
+                    pinAction("Start", color: .primary, action: onSetStart)
+                    pinAction("Ziel", color: .primary, action: onSetEnd)
+                    pinAction("Stopp", color: .primary, action: onSetVia)
+                    pinAction("Entfernen", color: LocusTheme.danger, action: onRemove)
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+                .fixedSize()
                 .locusGlass(.regular, in: Capsule())
                 .contentShape(Capsule())
                 .transition(.scale(scale: 0.9, anchor: .bottom).combined(with: .opacity))
@@ -46,6 +49,18 @@ struct MapDropPin: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(selected ? "Selected pin" : "Map pin")
         .accessibilityHint("Tap to show remove. Touch and hold to drag.")
+    }
+
+    private func pinAction(_ title: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(color)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var dragGesture: some Gesture {

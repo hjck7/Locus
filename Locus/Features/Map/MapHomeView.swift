@@ -51,16 +51,10 @@ struct MapHomeView: View {
                                         suppressNextMapTap = false
                                     }
                                 },
-                                onRemove: {
-                                    suppressNextMapTap = true
-                                    withAnimation {
-                                        session.pin = nil
-                                        pinSelected = false
-                                    }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        suppressNextMapTap = false
-                                    }
-                                },
+                                onRemove: { releasePin() },
+                                onSetStart: { assignPin(.start) },
+                                onSetEnd: { assignPin(.destination) },
+                                onSetVia: { assignPin(.via) },
                                 onDragBegan: {
                                     searchFocused = false
                                     suppressNextMapTap = true
@@ -98,10 +92,25 @@ struct MapHomeView: View {
                         MapPolyline(coordinates: route.coordinates)
                             .stroke(LocusTheme.accent, lineWidth: 6)
                     }
-                    ForEach(Array(planner.signals.enumerated()), id: \.offset) { _, signal in
-                        Annotation("", coordinate: signal) {
-                            Circle().fill(LocusTheme.statusBad).frame(width: 8, height: 8)
-                                .overlay(Circle().stroke(.white, lineWidth: 1))
+                    if !session.activeRoute.isEmpty {
+                        MapPolyline(coordinates: session.activeRoute)
+                            .stroke(LocusTheme.accentSecondary, lineWidth: 6)
+                    }
+                    if session.routeProgress == nil {
+                        ForEach(Array(planner.signals.enumerated()), id: \.offset) { _, signal in
+                            Annotation("", coordinate: signal) {
+                                Text("🚦").font(.caption2)
+                            }
+                        }
+                    }
+                    ForEach(session.stopMarkers) { marker in
+                        Annotation("", coordinate: marker.coordinate) {
+                            Text("\(marker.isTrafficLight ? "🚦" : "✋") \(marker.seconds) s")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(LocusTheme.accent))
                         }
                     }
                     if let start = planner.start {
@@ -183,6 +192,27 @@ struct MapHomeView: View {
             .overlay(Circle().stroke(.white, lineWidth: 2))
     }
 
+    private func releasePin() {
+        suppressNextMapTap = true
+        withAnimation {
+            session.pin = nil
+            pinSelected = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            suppressNextMapTap = false
+        }
+    }
+
+    private func assignPin(_ slot: RouteSlot) {
+        guard let pin = session.pin else { return }
+        let name = session.suggestedFavoriteName(for: pin, fallback: pinPlaceName)
+        planner.assign(slot, name: name, coordinate: pin, session: session)
+        releasePin()
+        if planner.destination != nil {
+            session.showRoutePlanner = true
+        }
+    }
+
     private func coordinateLabel(_ coordinate: CLLocationCoordinate2D) -> String {
         String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
     }
@@ -198,7 +228,7 @@ struct MapHomeView: View {
         } else {
             session.pin = coord
             pinPlaceName = nil
-            pinSelected = false
+            pinSelected = true
         }
     }
 

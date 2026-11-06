@@ -150,8 +150,16 @@ enum RouteBuilder {
         RouteCandidate(
             title: route.name.isEmpty ? "Route" : route.name,
             coordinates: coordinates(of: route.polyline),
-            turns: route.steps.dropFirst().compactMap { coordinates(of: $0.polyline).first }
+            turns: route.steps.dropFirst()
+                .filter { !isRoundabout($0) }
+                .compactMap { coordinates(of: $0.polyline).first }
         )
+    }
+
+    /// Traffic in a roundabout keeps flowing, so these maneuvers are not stop points.
+    private static func isRoundabout(_ step: MKRoute.Step) -> Bool {
+        let text = step.instructions.lowercased()
+        return ["kreisverkehr", "ausfahrt", "roundabout", "rotary", "exit"].contains { text.contains($0) }
     }
 
     private static func coordinates(of polyline: MKPolyline) -> [CLLocationCoordinate2D] {

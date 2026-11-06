@@ -421,7 +421,7 @@ struct RoutePlannerSheet: View {
         } label: {
             Label("Route starten", systemImage: "play.fill")
                 .font(.headline)
-                .foregroundStyle(.black)
+                .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .background(

@@ -109,7 +109,7 @@ struct PairOnDeviceView: View {
         HStack(alignment: .top, spacing: 12) {
             Text("\(n)")
                 .font(.caption.weight(.bold))
-                .foregroundStyle(.black)
+                .foregroundStyle(.white)
                 .frame(width: 22, height: 22)
                 .background(LocusTheme.accent, in: Circle())
             Text(text)
@@ -207,7 +207,7 @@ struct PairOnDeviceView: View {
             } label: {
                 Text(host.phase == .idle ? "Start pairing" : "Try again")
                     .font(.headline)
-                    .foregroundStyle(.black)
+                    .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .background(Capsule().fill(LocusTheme.accent))
@@ -224,7 +224,7 @@ struct PairOnDeviceView: View {
             } label: {
                 Text(mode == .embedded ? "Continue" : "Done")
                     .font(.headline)
-                    .foregroundStyle(.black)
+                    .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .background(Capsule().fill(LocusTheme.accent))
